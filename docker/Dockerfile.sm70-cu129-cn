@@ -19,6 +19,10 @@
 #                   for all FetchContent git clones and their submodules
 #   * csrc-build:    /workspace/.deps is a persistent cache mount, so the slow
 #                   proxied git clones only happen on the first build
+#   * csrc-build:    COPY of the tracked root-level flashinfer-sm70/ and
+#                   flash-attention-v100/ trees, required by the H3 SM70
+#                   extension targets (_h3_flashinfer_C / _h3_flashattn_C);
+#                   upstream Dockerfile's COPY list predates those targets
 #
 # Canonical build command:
 #   docker build \
@@ -400,6 +404,10 @@ COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY cmake cmake/
 COPY csrc csrc/
 COPY flash_qla flash_qla/
+# H3 SM70 extensions compile from tracked root-level source trees
+# (_h3_flashinfer_C / _h3_flashattn_C in CMakeLists.txt)
+COPY flashinfer-sm70 flashinfer-sm70/
+COPY flash-attention-v100 flash-attention-v100/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
 

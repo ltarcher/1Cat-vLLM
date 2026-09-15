@@ -17,6 +17,8 @@
 #                   /root/.gitconfig with http.version=HTTP/1.1, larger
 #                   postBuffer, and url.insteadOf rewrite through ghproxy.net
 #                   for all FetchContent git clones and their submodules
+#   * csrc-build:    /workspace/.deps is a persistent cache mount, so the slow
+#                   proxied git clones only happen on the first build
 #
 # Canonical build command:
 #   docker build \
@@ -475,9 +477,12 @@ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 ENV CCACHE_DIR=/root/.cache/ccache
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
+    # Persistent FetchContent cache: .deps survives across builds so the slow
+    # proxied git clones (triton, cutlass, DeepGEMM, flash-attention-v100, ...)
+    # only happen once. NOTE: if a clone ever gets corrupted, recovery is
+    # `docker builder prune --filter type=exec.cachemount` (clears ccache too).
+    --mount=type=cache,id=vllm-fetchcontent-deps,target=/workspace/.deps \
     if [ "$USE_SCCACHE" != "1" ]; then \
-        # Clean any existing CMake artifacts
-        rm -rf .deps && \
         mkdir -p .deps && \
         export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" && \
         export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" && \

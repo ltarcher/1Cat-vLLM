@@ -216,7 +216,7 @@ def test_qwen38_hybrid_page_long_context_graph_plan(
 
 
 @pytest.mark.parametrize("interleaved", [False, True])
-@pytest.mark.parametrize("kv_dtype", ["auto", "fp8_e4m3"])
+@pytest.mark.parametrize("kv_dtype", ["auto", "fp8_e4m3", "fp8_e5m2"])
 def test_attention_is_bitwise_invariant_to_physical_relocation(
     extension, interleaved, kv_dtype
 ):
@@ -230,6 +230,8 @@ def test_attention_is_bitwise_invariant_to_physical_relocation(
     )
     if kv_dtype == "fp8_e4m3":
         kv = kv.to(torch.float8_e4m3fn).view(torch.uint8)
+    elif kv_dtype == "fp8_e5m2":
+        kv = kv.to(torch.float8_e5m2).view(torch.uint8)
     query = torch.randn(
         8, 6, 256, generator=generator, dtype=torch.float16, device="cuda"
     )

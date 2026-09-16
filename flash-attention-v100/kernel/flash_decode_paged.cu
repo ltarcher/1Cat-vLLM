@@ -4435,7 +4435,8 @@ int64_t flash_attention_grouped_verify_request_major_abi_version() { return 1; }
 int64_t flash_attention_grouped_sparse_page4_abi_version() {
   // Version 1 accepted FP16 K/V through the nine-argument forward binding.
   // Version 2 adds kv_cache_dtype and calibrated K/V scales.
-  return 2;
+  // Version 3 adds FP8 E5M2 K/V (paired loader, page4 blocks).
+  return 3;
 }
 
 at::Tensor flash_attention_grouped_verify_paged(
@@ -4690,19 +4691,21 @@ at::Tensor flash_attention_grouped_sparse_page4(
                   seq_lens.is_cuda() && lse.is_cuda(),
               "grouped sparse page4 metadata must be CUDA tensors");
   const bool e4m3_kv = kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3";
+  const bool e5m2_kv = kv_cache_dtype == "fp8_e5m2";
+  const bool fp8_kv = e4m3_kv || e5m2_kv;
   TORCH_CHECK(q.dtype() == torch::kFloat16,
               "grouped sparse page4 requires fp16 queries");
-  TORCH_CHECK(e4m3_kv ? (k_cache.dtype() == torch::kUInt8 &&
-                         v_cache.dtype() == torch::kUInt8)
-                      : (k_cache.dtype() == torch::kFloat16 &&
-                         v_cache.dtype() == torch::kFloat16),
+  TORCH_CHECK(fp8_kv ? (k_cache.dtype() == torch::kUInt8 &&
+                        v_cache.dtype() == torch::kUInt8)
+                     : (k_cache.dtype() == torch::kFloat16 &&
+                        v_cache.dtype() == torch::kFloat16),
               "grouped sparse page4 KV storage does not match kv_cache_dtype");
   TORCH_CHECK(
-      e4m3_kv || kv_cache_dtype == "auto" || kv_cache_dtype == "float16",
-      "grouped sparse page4 supports fp16 and fp8_e4m3 KV only");
-  TORCH_CHECK(!e4m3_kv || (std::isfinite(k_scale) && std::isfinite(v_scale) &&
-                           k_scale > 0.0f && v_scale > 0.0f),
-              "grouped sparse page4 E4M3 scales must be finite and positive");
+      fp8_kv || kv_cache_dtype == "auto" || kv_cache_dtype == "float16",
+      "grouped sparse page4 supports fp16, fp8_e4m3, and fp8_e5m2 KV only");
+  TORCH_CHECK(!fp8_kv || (std::isfinite(k_scale) && std::isfinite(v_scale) &&
+                          k_scale > 0.0f && v_scale > 0.0f),
+              "grouped sparse page4 FP8 scales must be finite and positive");
   TORCH_CHECK(block_table.dtype() == torch::kInt32 &&
                   seq_lens.dtype() == torch::kInt32 &&
                   token_masks.scalar_type() == at::ScalarType::UInt32,
@@ -4772,11 +4775,14 @@ at::Tensor flash_attention_grouped_sparse_page4(
             kQueriesPerGroup, static_cast<int>(block_table.size(1)), 4,        \
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
-            softmax_scale * (e4m3_kv ? k_scale : 1.0f),                        \
-            e4m3_kv ? v_scale : 1.0f, token_masks.data_ptr<uint32_t>(),        \
+            softmax_scale * (fp8_kv ? k_scale : 1.0f),                         \
+            fp8_kv ? v_scale : 1.0f, token_masks.data_ptr<uint32_t>(),         \
             static_cast<int>(num_groups));                                     \
   } while (0)
-  if (e4m3_kv) {
+  if (e5m2_kv) {
+    // The paired E5M2 loader is valid for page4 blocks (token_offset >> 2).
+    LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
+  } else if (e4m3_kv) {
     LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
   } else {
     LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP16);

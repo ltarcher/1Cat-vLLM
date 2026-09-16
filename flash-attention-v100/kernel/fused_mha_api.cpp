@@ -51,6 +51,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_sparse_page4_plan_fwd",
         &flash_attention_grouped_sparse_page4_plan,
         "Build grouped exact QSA page4 tables over paged KV cache (Volta)");
+  m.def("dflash2_verify_sparse_topk",
+        &flash_attention_dflash2_verify_sparse_topk,
+        "Rank 32-token tiles by draft-mean query relevance and emit the "
+        "compact virtual page table for sparse DFlash2 verification (Volta)");
   m.def("decode_paged_wmma_fwd", &flash_attention_decode_paged_wmma,
         "FlashAttention single-query decode through paged-prefill WMMA order "
         "(Volta)");

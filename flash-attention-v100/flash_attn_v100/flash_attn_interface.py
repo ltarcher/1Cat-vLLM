@@ -25,6 +25,7 @@ _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
 _grouped_verify_workspace_cache = {}
+_dflash2_sparse_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +59,13 @@ class _PrefillSplitkv3Workspace:
 class _GroupedVerifyWorkspace:
     partial_out: torch.Tensor
     partial_lse: torch.Tensor
+
+
+@dataclass
+class _Dflash2SparseWorkspace:
+    tile_scores: torch.Tensor
+    compact_pages: torch.Tensor
+    compact_len: torch.Tensor
 
 
 def maybe_contiguous(x):
@@ -1160,6 +1168,8 @@ def flash_attn_grouped_verify_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     one_pass: bool = False,
+    token_table: bool = False,
+    compact_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
@@ -1168,6 +1178,10 @@ def flash_attn_grouped_verify_paged(
     paged-KV scan across a packed GQA group. Single-request q16 uses two
     three-head groups; batched requests use request-major q8 groups. Workspaces
     are stream- and batch-local and CUDA-graph safe.
+
+    ``token_table=True`` switches the block table to compact 32-token tile
+    tables: entries are absolute token bases and the loader resolves each
+    real token through the cache's own strides (sparse DFlash2 verify).
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1190,12 +1204,112 @@ def flash_attn_grouped_verify_paged(
         float(k_scale),
         float(v_scale),
         bool(one_pass),
+        bool(token_table),
+        # The binding wants a defined tensor; an empty one when unused.
+        compact_table if compact_table is not None else torch.Tensor(),
     )
 
 
 # Older native extensions retain the E5M2 route until rebuilt.
 flash_attn_grouped_verify_paged.supports_e4m3 = bool(  # type: ignore[attr-defined]
     getattr(flash_attn_v100_cuda, "grouped_verify_e4m3", False)
+)
+
+
+_DFLASH2_SPARSE_TILE = 32
+_DFLASH2_SPARSE_CAP_TILES = 8192
+_DFLASH2_SPARSE_COMPACT_PAGES = 72
+
+
+def _get_dflash2_sparse_workspace(q: torch.Tensor) -> _Dflash2SparseWorkspace:
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (q.device.type, device_index, _workspace_stream_id(q.device))
+    workspace = (
+        _dflash2_sparse_workspace_cache.get(key) if _can_cache_workspace(q) else None
+    )
+    if workspace is None:
+        workspace = _Dflash2SparseWorkspace(
+            tile_scores=torch.empty(
+                _DFLASH2_SPARSE_CAP_TILES, dtype=torch.float32, device=q.device
+            ),
+            compact_pages=torch.empty(
+                (1, _DFLASH2_SPARSE_COMPACT_PAGES), dtype=torch.int32, device=q.device
+            ),
+            compact_len=torch.empty(1, dtype=torch.int32, device=q.device),
+        )
+        if _can_cache_workspace(q):
+            _dflash2_sparse_workspace_cache[key] = workspace
+    return workspace
+
+
+def flash_attn_dflash2_verify_sparse_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor | None = None,
+    kv_cache_dtype: str = "fp8_e5m2",
+    softmax_scale: float | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    topk_tokens: int = 768,
+    sink_tokens: int = 256,
+    window_tokens: int = 1024,
+    min_sparse_tokens: int = 32768,
+    max_sparse_tokens: int = 262144,
+    seq_len: int | None = None,
+) -> torch.Tensor:
+    """Training-free sparse DFlash2 verification.
+
+    Ranks every 32-token tile by draft-mean query relevance against the K
+    cache, keeps sink + recent-window + top-k tiles, and runs the unchanged
+    eighty-CTA exact verifier over the compact token table. All device state
+    is static-shape and CUDA-graph safe; the host-side budgets only gate
+    dispatch, so captured graphs replay without syncs.
+    """
+    if kv_cache_dtype != "fp8_e5m2":
+        raise ValueError(
+            "flash_attn_dflash2_verify_sparse_paged supports fp8_e5m2 KV only, "
+            f"got {kv_cache_dtype!r}"
+        )
+    if seq_len is not None and not (min_sparse_tokens <= seq_len <= max_sparse_tokens):
+        raise ValueError(
+            f"seq_len {seq_len} outside the sparse verify range "
+            f"[{min_sparse_tokens}, {max_sparse_tokens}]"
+        )
+    workspace = _get_dflash2_sparse_workspace(q)
+    flash_attn_v100_cuda.dflash2_verify_sparse_topk(
+        q,
+        k_cache,
+        block_table,
+        seq_lens,
+        workspace.tile_scores,
+        workspace.compact_pages,
+        workspace.compact_len,
+        int(topk_tokens),
+        int(sink_tokens),
+        int(window_tokens),
+    )
+    return flash_attn_grouped_verify_paged(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        workspace.compact_len,
+        softmax_scale=softmax_scale,
+        out=out,
+        kv_cache_dtype="fp8_e5m2",
+        k_scale=k_scale,
+        v_scale=v_scale,
+        one_pass=True,
+        token_table=True,
+        compact_table=workspace.compact_pages,
+    )
+
+
+flash_attn_dflash2_verify_sparse_paged.available = bool(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "dflash2_verify_sparse_topk", None) is not None
 )
 
 

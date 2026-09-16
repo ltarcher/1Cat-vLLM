@@ -472,6 +472,10 @@ if TYPE_CHECKING:
 
     VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
+    VLLM_FLASH_V100_DFLASH2_SPARSE_TOPK: int = 0
+    VLLM_FLASH_V100_DFLASH2_SPARSE_WINDOW: int = 1024
+    VLLM_FLASH_V100_DFLASH2_SPARSE_SINK: int = 256
+    VLLM_FLASH_V100_DFLASH2_SPARSE_MIN_SEQ: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
     VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
@@ -3128,6 +3132,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
+    ),
+    # Training-free sparse verify (commit 3 of feature-dgk-fa). TOPK=0 keeps the
+    # dense verifier; >0 scores 32-token tiles with the main K cache and runs
+    # the dense grouped verifier on a compacted sink+window+topk tile set.
+    "VLLM_FLASH_V100_DFLASH2_SPARSE_TOPK": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DFLASH2_SPARSE_TOPK", "0")
+    ),
+    "VLLM_FLASH_V100_DFLASH2_SPARSE_WINDOW": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DFLASH2_SPARSE_WINDOW", "1024")
+    ),
+    "VLLM_FLASH_V100_DFLASH2_SPARSE_SINK": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DFLASH2_SPARSE_SINK", "256")
+    ),
+    "VLLM_FLASH_V100_DFLASH2_SPARSE_MIN_SEQ": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DFLASH2_SPARSE_MIN_SEQ", "32768")
     ),
     "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1"))

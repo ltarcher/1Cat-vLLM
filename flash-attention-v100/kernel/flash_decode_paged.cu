@@ -833,7 +833,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx = threadIdx.x,
-    const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const int* __restrict__ compact_table = nullptr) {
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
   if constexpr (FP8_PAIR_LOAD) {
     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
@@ -871,11 +872,21 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       } else if constexpr (BLOCK_SIZE == 3296) {
         logical_block = token_offset / 3296;
         block_offset = token_offset - logical_block * 3296;
+      } else if (block_size < 0) {
+        // Compact token table (sparse DFlash2 verify): the compact table
+        // holds absolute token bases of 32-token tiles. Resolve the real
+        // token, then its real page. `page_ids` still carries the real
+        // block table; the cache is addressed by physical page directly.
+        const int real_token =
+            compact_table[token_offset >> 5] + (token_offset & 31);
+        logical_block = real_token / (-block_size);
+        block_offset = real_token % (-block_size);
       } else {
         logical_block = token_offset / block_size;
         block_offset = token_offset % block_size;
       }
-      const int physical_block = page_ids[logical_block];
+      const int physical_block =
+          block_size < 0 ? logical_block : page_ids[logical_block];
       int64_t physical_offset;
       if constexpr (CONTIGUOUS_HKV1_LAYOUT) {
         constexpr int64_t kHeadDim = 256;
@@ -2042,7 +2053,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int64_t v_token_stride, const int64_t v_head_stride,
     const float qk_scale, const float v_scale,
     const uint32_t* __restrict__ sparse_token_masks = nullptr,
-    const int num_groups = 1, const int* row_lengths = nullptr) {
+    const int num_groups = 1, const int* row_lengths = nullptr,
+    const int* __restrict__ compact_table = nullptr) {
   static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
                 "explicit row lengths apply to dense causal groups only");
   static_assert(
@@ -2223,7 +2235,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                                 !SPARSE_PAGE4 && !ROW_SEQLENS)>(
           shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-          k_block_stride, k_token_stride, k_head_stride, 0);
+          k_block_stride, k_token_stride, k_head_stride, 0, threadIdx.x,
+          nullptr, compact_table);
       for (int idx = tid + valid_k_rows * kSharedStrideVec;
            idx < kGroupedVerifyBlockN * kSharedStrideVec;
            idx += kGroupedVerifyThreads) {
@@ -2314,7 +2327,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                               !SPARSE_PAGE4 && !ROW_SEQLENS)>(
         shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-        k_block_stride, k_token_stride, k_head_stride, 0);
+        k_block_stride, k_token_stride, k_head_stride, 0, threadIdx.x,
+        nullptr, compact_table);
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -2443,7 +2457,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                               !SPARSE_PAGE4 && !ROW_SEQLENS)>(
         shared_kv, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-        v_block_stride, v_token_stride, v_head_stride, 0);
+        v_block_stride, v_token_stride, v_head_stride, 0, threadIdx.x,
+        nullptr, compact_table);
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -4228,7 +4243,323 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   }
 }
 
+// ---------------------------------------------------------------------------
+// Training-free sparse dflash2 verify: tile scoring + top-k page selection.
+//
+// The exact verifier is latency-bound per N32 tile, so shrinking the scanned
+// context (not restructuring it) is what buys decode time. The score kernel
+// gathers K-only panels and ranks every 32-token tile by the best head's
+// draft-mean query relevance; the select kernel fuses sink + recent-window +
+// top-k tiles into a compact 32-token virtual page table that the unchanged
+// eighty-CTA dense verifier consumes. Everything is device-side with static
+// shapes, so the whole chain stays CUDA-graph capturable.
+// ---------------------------------------------------------------------------
+constexpr int kDflash2ScoreCapTiles = 8192;  // covers 262144 cached tokens
+// The scorer's ~22 KB static smem footprint allows four CTAs per SM (vs the
+// 52 KB verifier's one), which quarters the per-CTA tile run at 200K.
+constexpr int kDflash2ScoreCtas = 4 * kGroupedVerifyQ8Splits;
+constexpr int kDflash2CompactMaxPages = 72;  // sink 8 + window 32 + top-k 24 + slack
+constexpr int kDflash2SelectThreads = 256;
+constexpr int kDflash2ScoreMaxTopkTiles = 24;
+constexpr int kDflash2ScoreMaxSinkTiles = 8;
+constexpr int kDflash2ScoreMaxWindowTiles = 32;
+
+struct alignas(16) Dflash2ScoreSmem {
+  __half q6[kGroupedVerifyHeads * kGroupedVerifyKVStride];
+  alignas(16) __half kv[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
+  float partial[2][kGroupedVerifyHeads * kGroupedVerifyBlockN];
+  float head_max[kGroupedVerifyHeads];
+};
+
+template <int REAL_PAGE_SIZE>
+__global__ __launch_bounds__(kGroupedVerifyThreads, 4)
+void dflash2_verify_sparse_score_kernel(
+    const __half* __restrict__ q, const void* __restrict__ k_cache,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    float* __restrict__ tile_scores, const int page_size,
+    const int64_t k_block_stride, const int64_t k_token_stride,
+    const int64_t k_head_stride) {
+  __shared__ Dflash2ScoreSmem smem;
+  const int tid = threadIdx.x;
+  const int cached_tokens = *seq_lens;
+  const int num_tiles =
+      (cached_tokens + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
+  // Head-merged query: mean over the draft rows, kept per head.
+  for (int idx = tid; idx < kGroupedVerifyHeads * kGroupedVerifyHeadDim;
+       idx += kGroupedVerifyThreads) {
+    const int head = idx / kGroupedVerifyHeadDim;
+    const int dim = idx % kGroupedVerifyHeadDim;
+    float acc = 0.f;
+#pragma unroll
+    for (int token = 0; token < kGroupedVerifyQ8MaxQ; ++token) {
+      acc += __half2float(
+          q[(token * kGroupedVerifyHeads + head) * kGroupedVerifyHeadDim +
+            dim]);
+    }
+    smem.q6[head * kGroupedVerifyKVStride + dim] =
+        __float2half_rn(acc / kGroupedVerifyQ8MaxQ);
+  }
+  __syncthreads();
+
+  const int tiles_per_cta =
+      (num_tiles + kDflash2ScoreCtas - 1) / kDflash2ScoreCtas;
+  const int tile_begin = blockIdx.y * tiles_per_cta;
+  const int tile_end = min(tile_begin + tiles_per_cta, num_tiles);
+  constexpr int kPanelStrideVec = kGroupedVerifyHeadDim / 8;
+  constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
+  for (int tile = tile_begin; tile < tile_end; ++tile) {
+    const int valid =
+        min(kGroupedVerifyBlockN, cached_tokens - tile * kGroupedVerifyBlockN);
+    load_xqa_tc_kv_panel<REAL_PAGE_SIZE, false, kGroupedVerifyThreads,
+                         flash_v100::KV_CACHE_DTYPE_FP8_E5M2, true>(
+        smem.kv, k_cache, block_table, valid, kPanelStrideVec,
+        kSharedStrideVec, tile * kGroupedVerifyBlockN, 0,
+        page_size, 0, k_block_stride, k_token_stride, k_head_stride, 0);
+    __syncthreads();
+    // 384 of 512 threads: 6 heads x 32 tokens x 2 half-dim chunks.
+    if (tid < 2 * kGroupedVerifyHeads * kGroupedVerifyBlockN) {
+      const int pair = tid % (kGroupedVerifyHeads * kGroupedVerifyBlockN);
+      const int chunk = tid / (kGroupedVerifyHeads * kGroupedVerifyBlockN);
+      const int head = pair / kGroupedVerifyBlockN;
+      const int token = pair % kGroupedVerifyBlockN;
+      float acc = kXQANegInf;
+      if (token < valid) {
+        const __half* krow = smem.kv + token * kGroupedVerifyKVStride;
+        const __half* qrow = smem.q6 + head * kGroupedVerifyKVStride;
+        __half2 acc2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+        for (int d = 0; d < kGroupedVerifyHeadDim / 4; ++d) {
+          const int dim = chunk * (kGroupedVerifyHeadDim / 2) + d * 2;
+          acc2 = __hfma2(*reinterpret_cast<const __half2*>(krow + dim),
+                         *reinterpret_cast<const __half2*>(qrow + dim), acc2);
+        }
+        acc = __half2float(__low2half(acc2)) + __half2float(__high2half(acc2));
+      }
+      smem.partial[chunk][pair] = acc;
+    }
+    __syncthreads();
+    if (tid < kGroupedVerifyHeads * kGroupedVerifyBlockN) {
+      const float total = smem.partial[0][tid] + smem.partial[1][tid];
+      const float warp_max = warp_reduce_max(total);
+      if ((tid & (kWarpSize - 1)) == 0) {
+        smem.head_max[tid / kWarpSize] = warp_max;
+      }
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float best = kXQANegInf;
+#pragma unroll
+      for (int head = 0; head < kGroupedVerifyHeads; ++head) {
+        best = fmaxf(best, smem.head_max[head]);
+      }
+      tile_scores[tile] = best;
+    }
+  }
+}
+
+__global__ __launch_bounds__(kDflash2SelectThreads, 1)
+void dflash2_verify_sparse_select_kernel(
+    const float* __restrict__ tile_scores, const int* __restrict__ seq_lens,
+    const int* __restrict__ block_table,
+    int* __restrict__ compact_pages, int* __restrict__ compact_len,
+    const int page_size,
+    const int topk_tiles, const int sink_tiles, const int window_tiles) {
+  __shared__ uint32_t bitmap[kDflash2ScoreCapTiles / 32];
+  __shared__ int scan[kDflash2SelectThreads + 1];
+  __shared__ float best_scratch[kDflash2SelectThreads];
+  __shared__ int idx_scratch[kDflash2SelectThreads];
+  const int tid = threadIdx.x;
+  const int cached_tokens = *seq_lens;
+  const int num_tiles =
+      (cached_tokens + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
+  for (int word = tid; word < kDflash2ScoreCapTiles / 32;
+       word += kDflash2SelectThreads) {
+    bitmap[word] = 0;
+  }
+  __syncthreads();
+  const int mark_end = min(sink_tiles, num_tiles);
+  const int window_begin = max(0, num_tiles - window_tiles);
+  for (int tile = tid; tile < num_tiles; tile += kDflash2SelectThreads) {
+    const bool in_sink = tile < mark_end;
+    const bool in_window = tile >= window_begin;
+    if (in_sink || in_window) {
+      atomicOr(&bitmap[tile >> 5], 1u << (tile & 31));
+    }
+  }
+  if (tid == 0) {
+    // The final tile hosts the draft tokens themselves; attention semantics
+    // require it even with a zero-width window.
+    const int last = num_tiles - 1;
+    atomicOr(&bitmap[last >> 5], 1u << (last & 31));
+  }
+  __syncthreads();
+  for (int round = 0; round < topk_tiles; ++round) {
+    float local_best = kXQANegInf;
+    int local_idx = -1;
+    for (int tile = tid; tile < num_tiles; tile += kDflash2SelectThreads) {
+      const bool taken = (bitmap[tile >> 5] >> (tile & 31)) & 1u;
+      if (!taken && tile_scores[tile] > local_best) {
+        local_best = tile_scores[tile];
+        local_idx = tile;
+      }
+    }
+    best_scratch[tid] = local_best;
+    idx_scratch[tid] = local_idx;
+    __syncthreads();
+#pragma unroll
+    for (int stride = kDflash2SelectThreads / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        if (best_scratch[tid + stride] > best_scratch[tid]) {
+          best_scratch[tid] = best_scratch[tid + stride];
+          idx_scratch[tid] = idx_scratch[tid + stride];
+        }
+      }
+      __syncthreads();
+    }
+    if (tid == 0 && idx_scratch[0] >= 0) {
+      const int tile = idx_scratch[0];
+      atomicOr(&bitmap[tile >> 5], 1u << (tile & 31));
+    }
+    __syncthreads();
+  }
+  // Exclusive prefix over the bitmap words, then emit ascending tile bases.
+  scan[tid] = __popc(bitmap[tid]);
+  __syncthreads();
+#pragma unroll
+  for (int stride = 1; stride < kDflash2SelectThreads; stride <<= 1) {
+    int value = 0;
+    if (tid >= stride) {
+      value = scan[tid - stride];
+    }
+    __syncthreads();
+    if (tid >= stride) {
+      scan[tid] += value;
+    }
+    __syncthreads();
+  }
+  if (tid == kDflash2SelectThreads - 1) {
+    // scan[] now holds the inclusive count; expose it for the writer below.
+    scan[kDflash2SelectThreads] = scan[kDflash2SelectThreads - 1];
+  }
+  __syncthreads();
+  {
+    const int base = tid > 0 ? scan[tid - 1] : 0;
+    uint32_t word = bitmap[tid];
+    int out = base;
+    while (word != 0) {
+      const int bit = __ffs(word) - 1;
+      // The consumer's token-table gather addresses the cache directly by
+      // physical page, so entries must carry PHYSICAL token bases. Resolve
+      // this logical tile base through the block table; page_size is a
+      // multiple of the tile size, so a tile never straddles a page.
+      const int logical_base = (tid * 32 + bit) * kGroupedVerifyBlockN;
+      compact_pages[out++] =
+          __ldg(&block_table[logical_base / page_size]) * page_size +
+          logical_base % page_size;
+      word &= word - 1;
+    }
+  }
+  if (tid == kDflash2SelectThreads - 1) {
+    // The final tile is always kept and holds the draft tokens at its tail;
+    // trim its past-seq padding so the verifier's compact causal length
+    // counts real cached tokens only.
+    const int total_tiles = scan[kDflash2SelectThreads];
+    const int last_tile = num_tiles - 1;
+    const int last_real =
+        cached_tokens - last_tile * kGroupedVerifyBlockN;
+    compact_len[0] =
+        (total_tiles - 1) * kGroupedVerifyBlockN + min(kGroupedVerifyBlockN, last_real);
+  }
+}
+
 }  // namespace
+
+void flash_attention_dflash2_verify_sparse_topk(
+    const at::Tensor& q, const at::Tensor& k_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& tile_scores, at::Tensor& compact_pages,
+    at::Tensor& compact_len, int64_t topk_tokens, int64_t sink_tokens,
+    int64_t window_tokens) {
+  TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && block_table.is_cuda() &&
+                  seq_lens.is_cuda() && tile_scores.is_cuda() &&
+                  compact_pages.is_cuda() && compact_len.is_cuda(),
+              "dflash2 sparse topk tensors must be CUDA tensors");
+  TORCH_CHECK(q.dtype() == torch::kFloat16 && q.dim() == 3 &&
+                  q.size(0) == kGroupedVerifyQ8MaxQ &&
+                  q.size(1) == kGroupedVerifyHeads &&
+                  q.size(2) == kGroupedVerifyHeadDim && q.is_contiguous(),
+              "dflash2 sparse topk q must be contiguous fp16 [8, 6, 256]");
+  TORCH_CHECK(k_cache.dtype() == torch::kUInt8 && k_cache.dim() == 4 &&
+                  k_cache.size(2) == 1 &&
+                  k_cache.size(3) == kGroupedVerifyHeadDim &&
+                  k_cache.stride(-1) == 1,
+              "dflash2 sparse topk K cache must be E5M2 [pages, page, 1, 256]");
+  TORCH_CHECK(block_table.dtype() == torch::kInt32 &&
+                  seq_lens.dtype() == torch::kInt32 &&
+                  tile_scores.dtype() == torch::kFloat32 &&
+                  compact_pages.dtype() == torch::kInt32 &&
+                  compact_len.dtype() == torch::kInt32,
+              "dflash2 sparse topk metadata must be int32/fp32");
+  TORCH_CHECK(tile_scores.numel() == kDflash2ScoreCapTiles,
+              "dflash2 sparse topk scores workspace must hold 8192 tiles");
+  TORCH_CHECK(compact_pages.numel() == kDflash2CompactMaxPages &&
+                  compact_len.numel() == 1,
+              "dflash2 sparse topk compact workspace has the wrong shape");
+  TORCH_CHECK(topk_tokens >= 0 && sink_tokens >= 0 && window_tokens >= 0 &&
+                  topk_tokens % kGroupedVerifyBlockN == 0 &&
+                  sink_tokens % kGroupedVerifyBlockN == 0 &&
+                  window_tokens % kGroupedVerifyBlockN == 0,
+              "dflash2 sparse topk budgets must be non-negative 32-token multiples");
+  const int topk_tiles =
+      std::min<int>(topk_tokens / kGroupedVerifyBlockN,
+                    kDflash2ScoreMaxTopkTiles);
+  const int sink_tiles =
+      std::min<int>(sink_tokens / kGroupedVerifyBlockN,
+                    kDflash2ScoreMaxSinkTiles);
+  const int window_tiles =
+      std::min<int>(window_tokens / kGroupedVerifyBlockN,
+                    kDflash2ScoreMaxWindowTiles);
+  TORCH_CHECK(sink_tiles + window_tiles + topk_tiles <= kDflash2CompactMaxPages,
+              "dflash2 sparse topk budgets overflow the compact page table");
+
+  c10::cuda::CUDAGuard device_guard(q.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "dflash2 sparse topk supports SM70 only");
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+  const int page_size = static_cast<int>(k_cache.size(1));
+  // Compact entries carry one physical base per 32-token tile; a tile that
+  // straddles a page boundary would need two entries.
+  TORCH_CHECK(page_size % kGroupedVerifyBlockN == 0,
+              "dflash2 sparse topk requires page_size to be a multiple of ",
+              kGroupedVerifyBlockN);
+  const dim3 score_grid(1, kDflash2ScoreCtas, 1);
+#define LAUNCH_DFLASH2_SPARSE_SCORE(PAGE_BLOCK)                             \
+  do {                                                                      \
+    dflash2_verify_sparse_score_kernel<PAGE_BLOCK>                          \
+        <<<score_grid, kGroupedVerifyThreads, 0, stream>>>(                 \
+            reinterpret_cast<const __half*>(q.data_ptr()),                  \
+            k_cache.data_ptr(), block_table.data_ptr<int>(),                \
+            seq_lens.data_ptr<int>(), tile_scores.data_ptr<float>(),        \
+            page_size, k_cache.stride(0), k_cache.stride(1),                \
+            k_cache.stride(2));                                             \
+  } while (0)
+  if (page_size == 3296) {
+    LAUNCH_DFLASH2_SPARSE_SCORE(3296);
+  } else if (page_size == 1648) {
+    LAUNCH_DFLASH2_SPARSE_SCORE(1648);
+  } else {
+    LAUNCH_DFLASH2_SPARSE_SCORE(0);
+  }
+#undef LAUNCH_DFLASH2_SPARSE_SCORE
+  dflash2_verify_sparse_select_kernel<<<1, kDflash2SelectThreads, 0, stream>>>(
+      tile_scores.data_ptr<float>(), seq_lens.data_ptr<int>(),
+      block_table.data_ptr<int>(), compact_pages.data_ptr<int>(),
+      compact_len.data_ptr<int>(), page_size, topk_tiles, sink_tiles,
+      window_tiles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
     const at::Tensor& logical_indices, const at::Tensor& block_table,
@@ -4400,7 +4731,7 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
       partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      1, row_lengths.data_ptr<int>());
+      1, row_lengths.data_ptr<int>(), nullptr);
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
       <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
           partial.data_ptr<float>(), lse.data_ptr<float>(),
@@ -4445,7 +4776,8 @@ at::Tensor flash_attention_grouped_verify_paged(
     const at::Tensor& seq_lens, at::Tensor& partial_out,
     at::Tensor& partial_lse, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
-    const bool one_pass) {
+    const bool one_pass, const bool token_table,
+    const at::Tensor& compact_table) {
   TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
               "grouped verify q/K/V must be CUDA tensors");
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
@@ -4530,6 +4862,18 @@ at::Tensor flash_attention_grouped_verify_paged(
               "[batch, splits, query, 6]");
   TORCH_CHECK(k_scale > 0.0f && v_scale > 0.0f,
               "grouped verify E5M2 K/V scales must be positive");
+  // Token-table mode consumes compact 32-token tile tables (sparse DFlash2
+  // verify). It rides the generic runtime-stride route with a negative page
+  // size sentinel and only the FP8 pair loader implements it.
+  TORCH_CHECK(!token_table || kv_cache_dtype == "fp8_e5m2",
+              "grouped verify token-table mode requires E5M2 KV");
+  TORCH_CHECK(!token_table || (compact_table.defined() &&
+                               compact_table.dtype() == torch::kInt32 &&
+                               compact_table.is_cuda() &&
+                               compact_table.is_contiguous()),
+              "grouped verify token-table mode requires a compact int32 table");
+  const int* compact_table_ptr =
+      token_table ? compact_table.data_ptr<int>() : nullptr;
 
   at::Tensor out = out_.has_value() ? out_.value() : torch::empty_like(q);
   TORCH_CHECK(out.is_cuda() && out.device() == q.device() &&
@@ -4581,11 +4925,12 @@ at::Tensor flash_attention_grouped_verify_paged(
             seq_lens.data_ptr<int>(),                                          \
             reinterpret_cast<__half*>(partial_out.data_ptr()),                 \
             partial_lse.data_ptr<float>(), static_cast<int>(query_len),        \
-            static_cast<int>(block_table.size(1)),                             \
-            static_cast<int>(k_cache.size(1)), k_cache.stride(0),              \
+            static_cast<int>(block_table.size(1)), launch_page_size,           \
+            k_cache.stride(0),                                                 \
             k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),           \
             v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,     \
-            v_scale, nullptr, static_cast<int>(batch_size));                   \
+            v_scale, nullptr, static_cast<int>(batch_size), nullptr,           \
+            compact_table_ptr);                                                \
   } while (0)
 
 #define DISPATCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS,           \
@@ -4604,7 +4949,11 @@ at::Tensor flash_attention_grouped_verify_paged(
         v_cache.stride(2) == kGroupedVerifyHeadDim;                           \
     const bool stage_page_ids =                                               \
         fixed_interleaved_layout && dflash2_grouped_stage_page_ids_enabled(); \
-    if (stage_page_ids && page_size == 1648) {                                \
+    if (token_table) {                                                        \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0,            \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+    } else if (stage_page_ids && page_size == 1648) {                                \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
                                     SINGLE_QUERY, true, true,                 \
                                     flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
@@ -4636,6 +4985,11 @@ at::Tensor flash_attention_grouped_verify_paged(
   } while (0)
 
   const bool single_query = query_len == 1;
+  // Negative page size tells the loader to treat block-table entries as
+  // absolute token bases of 32-token compact tiles (sparse verify).
+  const int launch_page_size =
+      token_table ? -static_cast<int>(k_cache.size(1))
+                  : static_cast<int>(k_cache.size(1));
   if (kv_cache_dtype == "fp8_e4m3") {
     // Reuse the grouped q8 schedule and existing E4M3 vector conversion.
     // Runtime strides cover both separate and interleaved hybrid KV pages.

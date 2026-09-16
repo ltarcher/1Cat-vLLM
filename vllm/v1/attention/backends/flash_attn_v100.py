@@ -535,6 +535,7 @@ _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
+_logged_prefill_smallq_grouped_verify_sparse = False
 _logged_prefill_smallq_grouped_verify_gate = False
 _logged_prefill_fa2_d256 = False
 _logged_prefill_dense_splitkv3 = False
@@ -1303,6 +1304,31 @@ def _get_flash_grouped_verify_op():
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return _flash_attn_grouped_verify_paged
+
+
+_flash_attn_dflash2_sparse_paged: object = None
+_flash_attn_dflash2_sparse_checked = False
+
+
+def _get_flash_dflash2_sparse_op():
+    """Load the optional training-free sparse DFlash2 verifier entry."""
+    global _flash_attn_dflash2_sparse_paged
+    global _flash_attn_dflash2_sparse_checked
+    if _flash_attn_dflash2_sparse_checked:
+        return _flash_attn_dflash2_sparse_paged or None
+
+    _flash_attn_dflash2_sparse_checked = True
+    try:
+        from flash_attn_v100 import flash_attn_dflash2_verify_sparse_paged
+
+        # The Python entry exists even on older extensions; `.available`
+        # reflects whether the native scorer was compiled in, so stale .so
+        # deployments fall back to the dense verifier.
+        if getattr(flash_attn_dflash2_verify_sparse_paged, "available", False):
+            _flash_attn_dflash2_sparse_paged = flash_attn_dflash2_verify_sparse_paged
+    except ImportError:
+        _flash_attn_dflash2_sparse_paged = None
+    return _flash_attn_dflash2_sparse_paged
 
 
 def _get_sm70_splitd_d256_ops():
@@ -4628,6 +4654,35 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             raise ValueError(
                 "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN must be positive"
             )
+        # Training-free sparse verify (feature-dgk-fa commit 3): score 32-token
+        # tiles with the main K cache, keep sink+window+topk tiles, and run the
+        # dense grouped verifier on the compacted page set. TOPK=0 disables it
+        # so the dense path remains the default.
+        self.dflash2_sparse_verify_op = _get_flash_dflash2_sparse_op()
+        self.dflash2_sparse_topk_tokens = (
+            envs.VLLM_FLASH_V100_DFLASH2_SPARSE_TOPK
+        )
+        self.dflash2_sparse_window_tokens = (
+            envs.VLLM_FLASH_V100_DFLASH2_SPARSE_WINDOW
+        )
+        self.dflash2_sparse_sink_tokens = (
+            envs.VLLM_FLASH_V100_DFLASH2_SPARSE_SINK
+        )
+        self.dflash2_sparse_min_seq = envs.VLLM_FLASH_V100_DFLASH2_SPARSE_MIN_SEQ
+        self.use_dflash2_sparse_verify = (
+            self.use_dflash2_grouped_verify
+            and self.dflash2_sparse_verify_op is not None
+            and self.dflash2_sparse_topk_tokens > 0
+        )
+        if self.use_dflash2_sparse_verify:
+            logger.info_once(
+                "Flash-V100 DFlash2 sparse verify enabled: topk=%d window=%d "
+                "sink=%d min_seq=%d",
+                self.dflash2_sparse_topk_tokens,
+                self.dflash2_sparse_window_tokens,
+                self.dflash2_sparse_sink_tokens,
+                self.dflash2_sparse_min_seq,
+            )
         decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
         self.compare_bhmd_out_dir = os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
@@ -5545,6 +5600,97 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "dflash2_grouped_verify")
         _record_route("prefill_smallq_dflash2_grouped_verify")
+
+    # Hard capacity of the sparse-verify tile score buffer: 8192 tiles of 32
+    # tokens == 262144 tokens. The gate rejects longer models so the kernels
+    # can never index past the static workspace.
+    _DFLASH2_SPARSE_MAX_TOKENS = 8192 * 32
+
+    def _dflash2_sparse_verify_allowed(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        num_query_tokens: int,
+    ) -> bool:
+        """Gate the training-free sparse verifier on its contract.
+
+        Mirrors ``_dflash2_grouped_verify_allowed`` but pins the shape to the
+        single-request q8 route the scorer implements, and uses only
+        capture-stable values (max_model_len, never the live seq_lens) so
+        captured CUDA graphs replay the same route they were captured with.
+        Correctness holds for every sequence length — short sequences simply
+        mark every tile and degenerate to the dense result.
+        """
+        block_table = getattr(attn_metadata, "block_table", None)
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        max_model_len = int(getattr(attn_metadata, "max_model_len", 0))
+        # The runtime metadata carries no `num_reqs` attribute; the dense
+        # gate derives the live request count from block_table's leading
+        # dim, and so must this one.
+        num_reqs = 0 if block_table is None else int(block_table.shape[0])
+        allowed = bool(
+            self.use_dflash2_sparse_verify
+            and num_reqs == 1
+            and num_query_tokens == 8
+            and getattr(attn_metadata, "is_dflash_selector_target", False)
+            and self.dflash2_sparse_min_seq <= max_model_len
+            and max_model_len <= self._DFLASH2_SPARSE_MAX_TOKENS
+            and self._dflash2_grouped_verify_allowed(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                num_query_tokens=num_query_tokens,
+            )
+            # block_table/seq_lens are graph-padded to max_num_seqs rows; the
+            # call site slices [:1], so only their presence is checked here.
+            and block_table is not None
+            and seq_lens is not None
+        )
+        return allowed
+
+    def _call_dflash2_grouped_verify_sparse(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        global _logged_prefill_smallq_grouped_verify_sparse
+        if not _logged_prefill_smallq_grouped_verify_sparse:
+            logger.info(
+                "FLASH_ATTN_V100 DFlash2 sparse verifier active "
+                "(single-request q8/H6/D256, %s KV, topk=%d window=%d sink=%d).",
+                self.kv_cache_dtype,
+                self.dflash2_sparse_topk_tokens,
+                self.dflash2_sparse_window_tokens,
+                self.dflash2_sparse_sink_tokens,
+            )
+            _logged_prefill_smallq_grouped_verify_sparse = True
+        self.dflash2_sparse_verify_op(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table[:1],
+            attn_metadata.seq_lens[:1],
+            out=out,
+            kv_cache_dtype=self.kv_cache_dtype,
+            softmax_scale=self.scale,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
+            topk_tokens=self.dflash2_sparse_topk_tokens,
+            sink_tokens=self.dflash2_sparse_sink_tokens,
+            window_tokens=self.dflash2_sparse_window_tokens,
+            min_sparse_tokens=self.dflash2_sparse_min_seq,
+            max_sparse_tokens=self._DFLASH2_SPARSE_MAX_TOKENS,
+        )
+        _record_route("prefill_smallq_dflash2_grouped_verify_sparse")
 
     def _smallq_decode_xqa_allowed(
         self,
@@ -7331,6 +7477,26 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         ):
             query = query[:num_query_tokens]
             out_view = output[:num_query_tokens]
+            # Training-free sparse verify: score 32-token tiles, keep
+            # sink+window+topk, then rerun the same verifier on the compact
+            # table. Falls through to the dense call when the sparse contract
+            # (single-request q8, capture-stable model length) is not met.
+            if self.use_dflash2_sparse_verify and self._dflash2_sparse_verify_allowed(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                num_query_tokens=num_query_tokens,
+            ):
+                self._call_dflash2_grouped_verify_sparse(
+                    layer,
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata,
+                    out=out_view,
+                )
+                return output
             self._call_dflash2_grouped_verify(
                 layer,
                 query,

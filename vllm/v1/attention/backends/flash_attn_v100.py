@@ -5618,11 +5618,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         """Gate the training-free sparse verifier on its contract.
 
         Mirrors ``_dflash2_grouped_verify_allowed`` but pins the shape to the
-        single-request q8 route the scorer implements, and uses only
-        capture-stable values (max_model_len, never the live seq_lens) so
-        captured CUDA graphs replay the same route they were captured with.
-        Correctness holds for every sequence length — short sequences simply
-        mark every tile and degenerate to the dense result.
+        request-major q8 routes the scorer implements: one request (q8) or a
+        batched set of 2/4/8 requests (num_query_tokens == 8 per request).
+        Only capture-stable values (max_model_len, never the live seq_lens)
+        decide route-relevant limits, so captured CUDA graphs replay the same
+        route they were captured with. Correctness holds for every sequence
+        length — short sequences simply mark every tile and degenerate to the
+        dense result.
         """
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
@@ -5631,10 +5633,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # gate derives the live request count from block_table's leading
         # dim, and so must this one.
         num_reqs = 0 if block_table is None else int(block_table.shape[0])
+        request_major_shape = bool(
+            # Single request (B1) or batched 2/4/8 requests, each with its
+            # q8 draft span; the scorer tiles scores per block-table row.
+            num_reqs >= 1
+            and num_reqs in (1, 2, 4, 8)
+            and num_query_tokens == num_reqs * 8
+        )
         allowed = bool(
             self.use_dflash2_sparse_verify
-            and num_reqs == 1
-            and num_query_tokens == 8
+            and request_major_shape
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and self.dflash2_sparse_min_seq <= max_model_len
             and max_model_len <= self._DFLASH2_SPARSE_MAX_TOKENS
@@ -5645,8 +5653,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 attn_metadata,
                 num_query_tokens=num_query_tokens,
             )
-            # block_table/seq_lens are graph-padded to max_num_seqs rows; the
-            # call site slices [:1], so only their presence is checked here.
+            # The dense gate above already pins block_table/seq_lens to
+            # exactly num_reqs rows; only their presence is rechecked here.
             and block_table is not None
             and seq_lens is not None
         )
@@ -5666,19 +5674,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify_sparse:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 sparse verifier active "
-                "(single-request q8/H6/D256, %s KV, topk=%d window=%d sink=%d).",
+                "(request-major B%d/q8/H6/D256, %s KV, topk=%d window=%d "
+                "sink=%d).",
+                int(attn_metadata.block_table.shape[0]),
                 self.kv_cache_dtype,
                 self.dflash2_sparse_topk_tokens,
                 self.dflash2_sparse_window_tokens,
                 self.dflash2_sparse_sink_tokens,
             )
             _logged_prefill_smallq_grouped_verify_sparse = True
+        # The gate pins block_table/seq_lens to exactly one row per request;
+        # the op scores and selects a compact table for every row.
         self.dflash2_sparse_verify_op(
             query,
             key_cache,
             value_cache,
-            attn_metadata.block_table[:1],
-            attn_metadata.seq_lens[:1],
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
             out=out,
             kv_cache_dtype=self.kv_cache_dtype,
             softmax_scale=self.scale,
@@ -7478,9 +7490,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             query = query[:num_query_tokens]
             out_view = output[:num_query_tokens]
             # Training-free sparse verify: score 32-token tiles, keep
-            # sink+window+topk, then rerun the same verifier on the compact
-            # table. Falls through to the dense call when the sparse contract
-            # (single-request q8, capture-stable model length) is not met.
+            # sink+window+topk per request row, then rerun the same verifier
+            # on the compact tables. Falls through to the dense call when the
+            # sparse contract (request-major q8, capture-stable model length)
+            # is not met.
             if self.use_dflash2_sparse_verify and self._dflash2_sparse_verify_allowed(
                 query,
                 key_cache,

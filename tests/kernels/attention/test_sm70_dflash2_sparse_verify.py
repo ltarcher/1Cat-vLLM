@@ -321,3 +321,241 @@ def test_sm70_dflash2_sparse_cuda_graph_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(static_out, eager_reference, rtol=0.0, atol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Batched (request-major) sparse verify: the scorer/selector must tile and
+# select per block-table row, and the consumer must resolve each row's
+# compact table through its own row stride. B1 stays bitwise identical, so
+# these tests exercise B > 1 against the batched dense verifier.
+# ---------------------------------------------------------------------------
+
+
+def _batched_block_table(num_seqs: int, pages_per_seq: int) -> torch.Tensor:
+    """Row-major identity page tables with a private page range per row."""
+    return torch.stack(
+        [
+            torch.arange(
+                r * pages_per_seq,
+                (r + 1) * pages_per_seq,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            for r in range(num_seqs)
+        ]
+    )
+
+
+@pytest.mark.parametrize("num_seqs", [2, 4])
+@torch.inference_mode()
+def test_sm70_dflash2_sparse_batched_covered_budget_matches_dense(
+    num_seqs: int,
+) -> None:
+    """B2/B4 with per-row covered budgets: batched sparse == batched dense."""
+    interface, sparse_op = _require_sparse_verify()
+    dense_op = _dense_grouped_verify(interface)
+    torch.manual_seed(31)
+    seq_lens_list = [1024, 2048] * 2
+    seq_lens_list = seq_lens_list[:num_seqs]
+    max_seq = max(seq_lens_list)
+    pages_per_seq = (max_seq + PAGE - 1) // PAGE
+    query = (
+        torch.randn((num_seqs * 8, 6, 256), dtype=torch.float16, device="cuda") * 0.2
+    )
+    key_cache, value_cache = _make_paged_cache(pages_per_seq * num_seqs)
+    block_table = _batched_block_table(num_seqs, pages_per_seq)
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device="cuda")
+
+    sparse_out = _run_sparse(
+        sparse_op, query, key_cache, value_cache, block_table, seq_lens
+    )
+    dense_out = dense_op(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        kv_cache_dtype="fp8_e5m2",
+        one_pass=True,
+    )
+    torch.testing.assert_close(sparse_out, dense_out, rtol=0.0, atol=0.0)
+
+
+@torch.inference_mode()
+def test_sm70_dflash2_sparse_batched_permuted_pages_match_dense() -> None:
+    """Per-row permuted page tables: compact entries stay row-local.
+
+    Each request row permutes its own 32-page slice, so a compact entry that
+    ignored the row offset of the batched table would gather another row's
+    physical pages and break the dense match.
+    """
+    interface, sparse_op = _require_sparse_verify()
+    dense_op = _dense_grouped_verify(interface)
+    torch.manual_seed(37)
+    page = 64
+    seq_len = 2048  # 64 tiles == sink 8 + window 32 + top-k 24: full coverage
+    num_seqs = 2
+    pages_per_seq = seq_len // page
+    num_pages = pages_per_seq * num_seqs
+    cache = torch.randn(
+        (num_pages, 2 * page, 1, 256), dtype=torch.float16, device="cuda"
+    )
+    perm_rows = []
+    for r in range(num_seqs):
+        # Permute only this row's slice, reading from a clone: logical page l
+        # of row r lives at physical page perm_rows[r][l].
+        local = torch.randperm(pages_per_seq, device="cuda")
+        perm = local + r * pages_per_seq
+        src = cache[r * pages_per_seq : (r + 1) * pages_per_seq].clone()
+        cache.index_copy_(0, perm, src)
+        perm_rows.append(perm)
+    key_cache = cache.to(torch.float8_e5m2).view(torch.uint8)[:, :page]
+    value_cache = cache.to(torch.float8_e5m2).view(torch.uint8)[:, page:]
+    block_table = torch.stack(perm_rows).to(torch.int32)
+    seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32, device="cuda")
+    query = (
+        torch.randn((num_seqs * 8, 6, 256), dtype=torch.float16, device="cuda") * 0.2
+    )
+
+    sparse_out = _run_sparse(
+        sparse_op, query, key_cache, value_cache, block_table, seq_lens
+    )
+    dense_out = dense_op(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        kv_cache_dtype="fp8_e5m2",
+        one_pass=True,
+    )
+    torch.testing.assert_close(sparse_out, dense_out, rtol=0.0, atol=0.0)
+
+
+@torch.inference_mode()
+def test_sm70_dflash2_sparse_batched_mixed_lengths() -> None:
+    """Rows of different lengths select independently; both hit the reference."""
+    interface, sparse_op = _require_sparse_verify()
+    extension = interface.flash_attn_v100_cuda
+    torch.manual_seed(41)
+    num_seqs = 2
+    seq_lens_list = [4096, 3000]  # 128 and 94 tiles: both trigger real top-k
+    pages_per_seq = 2
+    query = (
+        torch.randn((num_seqs * 8, 6, 256), dtype=torch.float16, device="cuda") * 0.2
+    )
+    key_cache, value_cache = _make_paged_cache(pages_per_seq * num_seqs + 1)
+    block_table = _batched_block_table(num_seqs, pages_per_seq)
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device="cuda")
+
+    scores = torch.empty(num_seqs * 8192, dtype=torch.float32, device="cuda")
+    pages = torch.empty((num_seqs, 72), dtype=torch.int32, device="cuda")
+    length = torch.empty(num_seqs, dtype=torch.int32, device="cuda")
+    extension.dflash2_verify_sparse_topk(
+        query,
+        key_cache,
+        block_table,
+        seq_lens,
+        scores,
+        pages,
+        length,
+        768,
+        256,
+        1024,
+    )
+    compact_lens = []
+    for r, seq_len in enumerate(seq_lens_list):
+        compact_len = int(length[r].item())
+        num_selected = (compact_len + SPARSE_TILE - 1) // SPARSE_TILE
+        selected = pages[r][:num_selected]
+        # Ascending tile bases ending at the row's real last tile, with the
+        # compact length trimmed to it — per row, not just row 0. Entries are
+        # PHYSICAL bases: row r's pages start at physical page r*pages_per_seq,
+        # so subtract that row offset before comparing with logical tiles.
+        row_page_offset = r * pages_per_seq * PAGE
+        assert (selected.diff() > 0).all()
+        last_logical = int(selected[-1]) - row_page_offset
+        assert last_logical == ((seq_len - 1) // SPARSE_TILE) * SPARSE_TILE
+        assert compact_len == (num_selected - 1) * SPARSE_TILE + (
+            seq_len - last_logical
+        )
+        compact_lens.append((compact_len, selected, row_page_offset))
+
+    sparse_out = _run_sparse(
+        sparse_op, query, key_cache, value_cache, block_table, seq_lens
+    )
+    assert sparse_out.shape == (num_seqs * 8, 6, 256)
+    scale = query.shape[-1] ** -0.5
+    for r, (compact_len, selected, _offset) in enumerate(compact_lens):
+        token_ids = selected[:, None] + torch.arange(SPARSE_TILE, device="cuda")[
+            None, :
+        ]
+        token_ids = token_ids.reshape(-1)[:compact_len]
+        keys = _tile_view(key_cache, token_ids)
+        values = _tile_view(value_cache, token_ids)
+        q_rows = query[r * 8 : (r + 1) * 8]
+        prefix = compact_len - q_rows.shape[0]
+        reference = torch.empty((8, 6, 256), dtype=torch.float32, device="cuda")
+        for row in range(q_rows.shape[0]):
+            visible = prefix + row + 1
+            logits = q_rows[row].float() @ keys[:visible].T * scale
+            weights = torch.softmax(logits, dim=-1)
+            reference[row] = weights @ values[:visible]
+        torch.testing.assert_close(
+            sparse_out[r * 8 : (r + 1) * 8].float(), reference, rtol=3e-2, atol=3e-2
+        )
+
+
+@torch.inference_mode()
+def test_sm70_dflash2_sparse_batched_cuda_graph_replay() -> None:
+    """B2 capture once, replay with growing seq_lens; outputs stay exact."""
+    interface, sparse_op = _require_sparse_verify()
+    torch.manual_seed(43)
+    num_seqs = 2
+    query = (
+        torch.randn((num_seqs * 8, 6, 256), dtype=torch.float16, device="cuda") * 0.2
+    )
+    seq_len = 40000
+    max_seq = seq_len + 4096
+    pages_per_seq = (max_seq + PAGE - 1) // PAGE + 1
+    key_cache, value_cache = _make_paged_cache(pages_per_seq * num_seqs)
+    block_table = _batched_block_table(num_seqs, pages_per_seq)
+    seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32, device="cuda")
+    static_out = torch.empty(
+        (num_seqs * 8, 6, 256), dtype=torch.float16, device="cuda"
+    )
+
+    def _capture_target() -> None:
+        _run_sparse(
+            sparse_op,
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            out=static_out,
+        )
+
+    _capture_target()
+    torch.cuda.synchronize()
+    eager_reference = static_out.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _capture_target()
+    torch.cuda.synchronize()
+
+    for delta in (0, 32, 4096):
+        seq_lens.fill_(seq_len + delta)
+        graph.replay()
+        torch.cuda.synchronize()
+        # Same inputs through the captured graph and a fresh eager call must
+        # agree bitwise (static workspaces, no host-side branching).
+        reference = _run_sparse(
+            sparse_op, query, key_cache, value_cache, block_table, seq_lens
+        )
+        torch.testing.assert_close(static_out, reference, rtol=0.0, atol=0.0)
+    seq_lens.fill_(seq_len)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(static_out, eager_reference, rtol=0.0, atol=0.0)

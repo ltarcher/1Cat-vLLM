@@ -1219,23 +1219,31 @@ flash_attn_grouped_verify_paged.supports_e4m3 = bool(  # type: ignore[attr-defin
 _DFLASH2_SPARSE_TILE = 32
 _DFLASH2_SPARSE_CAP_TILES = 8192
 _DFLASH2_SPARSE_COMPACT_PAGES = 72
+# Draft rows per request in the request-major grouped verifier (q8).
+_DFLASH2_SPARSE_DRAFT_ROWS = 8
 
 
-def _get_dflash2_sparse_workspace(q: torch.Tensor) -> _Dflash2SparseWorkspace:
+def _get_dflash2_sparse_workspace(
+    q: torch.Tensor, batch: int
+) -> _Dflash2SparseWorkspace:
     device_index = q.device.index if q.device.index is not None else -1
-    key = (q.device.type, device_index, _workspace_stream_id(q.device))
+    key = (q.device.type, device_index, _workspace_stream_id(q.device), batch)
     workspace = (
         _dflash2_sparse_workspace_cache.get(key) if _can_cache_workspace(q) else None
     )
     if workspace is None:
         workspace = _Dflash2SparseWorkspace(
             tile_scores=torch.empty(
-                _DFLASH2_SPARSE_CAP_TILES, dtype=torch.float32, device=q.device
+                batch * _DFLASH2_SPARSE_CAP_TILES,
+                dtype=torch.float32,
+                device=q.device,
             ),
             compact_pages=torch.empty(
-                (1, _DFLASH2_SPARSE_COMPACT_PAGES), dtype=torch.int32, device=q.device
+                (batch, _DFLASH2_SPARSE_COMPACT_PAGES),
+                dtype=torch.int32,
+                device=q.device,
             ),
-            compact_len=torch.empty(1, dtype=torch.int32, device=q.device),
+            compact_len=torch.empty(batch, dtype=torch.int32, device=q.device),
         )
         if _can_cache_workspace(q):
             _dflash2_sparse_workspace_cache[key] = workspace
@@ -1278,7 +1286,9 @@ def flash_attn_dflash2_verify_sparse_paged(
             f"seq_len {seq_len} outside the sparse verify range "
             f"[{min_sparse_tokens}, {max_sparse_tokens}]"
         )
-    workspace = _get_dflash2_sparse_workspace(q)
+    workspace = _get_dflash2_sparse_workspace(
+        q, q.shape[0] // _DFLASH2_SPARSE_DRAFT_ROWS
+    )
     flash_attn_v100_cuda.dflash2_verify_sparse_topk(
         q,
         k_cache,

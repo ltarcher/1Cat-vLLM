@@ -267,3 +267,171 @@ def test_native_mtp_leaves_unrelated_drafters_unchanged(field: str, value: str) 
     original = copy.deepcopy(draft_hf_config.to_dict())
     SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
     assert draft_hf_config.to_dict() == original
+
+
+def _dflash_yarn_config(
+    *,
+    max_model_len: int = 524_281,  # 524288 (262144 * 2.0) minus 7 spec slots
+    num_speculative_tokens: int = 7,
+    draft_rope_parameters: dict[str, Any] | None = None,
+) -> tuple[Any, PretrainedConfig]:
+    """Mirror the Qwen3.8-27B target + DFlash2 drafter YaRN 512K setup.
+
+    The target extends 262144 -> 524288 with yarn; the drafter checkpoint only
+    ships its native plain rope. The mrope/partial-rotary keys are target
+    layout details a drafter must not copy.
+    """
+    if draft_rope_parameters is None:
+        draft_rope_parameters = {"rope_theta": 10_000_000, "rope_type": "default"}
+    target_hf_config = PretrainedConfig(max_position_embeddings=262_144)
+    target_hf_config.rope_parameters = {
+        "rope_theta": 10_000_000,
+        "rope_type": "yarn",
+        "mrope_section": [11, 11, 10],
+        "mrope_interleaved": True,
+        "partial_rotary_factor": 0.25,
+        "factor": 2.0,
+        "original_max_position_embeddings": 262_144,
+    }
+    draft_hf_config = PretrainedConfig(max_position_embeddings=262_144)
+    draft_hf_config.rope_parameters = copy.deepcopy(draft_rope_parameters)
+    target_model_config = SimpleNamespace(
+        model="test/qwen3.8-27b",
+        max_model_len=524_288,
+        hf_config=target_hf_config,
+    )
+    config = SimpleNamespace(
+        method="dflash",
+        model="test/dflash2-draft",
+        max_model_len=max_model_len,
+        num_speculative_tokens=num_speculative_tokens,
+        num_speculative_state_tokens=lambda: num_speculative_tokens,
+        use_dflash_ddtree=lambda: False,
+        ddtree_disable_tree_verify=False,
+        ddtree_budget=None,
+        target_model_config=target_model_config,
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+    )
+    return config, draft_hf_config
+
+
+def test_dflash_inherits_only_target_yarn_scaling() -> None:
+    config, draft_hf_config = _dflash_yarn_config()
+
+    SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+    assert draft_hf_config.rope_parameters == {
+        "rope_type": "yarn",
+        "rope_theta": 10_000_000,
+        "factor": 2.0,
+        "original_max_position_embeddings": 262_144,
+    }
+    assert draft_hf_config.max_position_embeddings == 262_144
+
+
+def test_dflash_leaves_drafter_within_native_grid_unchanged() -> None:
+    config, draft_hf_config = _dflash_yarn_config(max_model_len=262_144)
+    original = copy.deepcopy(draft_hf_config.to_dict())
+
+    SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+    assert draft_hf_config.to_dict() == original
+
+
+def test_dflash_leaves_preexisting_yarn_drafter_unchanged() -> None:
+    config, draft_hf_config = _dflash_yarn_config(
+        draft_rope_parameters={
+            "rope_theta": 10_000_000,
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 262_144,
+        }
+    )
+    original = copy.deepcopy(draft_hf_config.to_dict())
+
+    SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+    assert draft_hf_config.to_dict() == original
+
+
+def test_dflash_rejects_non_yarn_target_extension() -> None:
+    config, _ = _dflash_yarn_config()
+    config.target_model_config.hf_config.rope_parameters = {
+        "rope_theta": 10_000_000,
+        "rope_type": "default",
+    }
+
+    with pytest.raises(ValueError, match="explicit target YaRN"):
+        SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+
+def test_dflash_rejects_native_limit_mismatch() -> None:
+    config, _ = _dflash_yarn_config()
+    config.target_model_config.hf_config.rope_parameters[
+        "original_max_position_embeddings"
+    ] = 131_072
+
+    with pytest.raises(ValueError, match="to match the drafter's"):
+        SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+
+@pytest.mark.parametrize("factor", [0.0, 1.0, float("nan"), float("inf"), 1e308])
+def test_dflash_rejects_invalid_or_overflowing_yarn_factor(factor: float) -> None:
+    config, _ = _dflash_yarn_config()
+    config.target_model_config.hf_config.rope_parameters["factor"] = factor
+    with pytest.raises(ValueError):
+        SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+
+def test_dflash_rejects_max_model_len_without_spec_headroom() -> None:
+    # 262144 * 2.0 = 524288 cache rows; the drafter proposes up to
+    # seq_len + num_speculative_tokens, so 524288 itself would overflow.
+    config, _ = _dflash_yarn_config(max_model_len=524_288, num_speculative_tokens=7)
+
+    with pytest.raises(ValueError, match="Lower --max-model-len to 524281"):
+        SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+
+def test_dflash_accepts_max_model_len_with_spec_headroom() -> None:
+    config, draft_hf_config = _dflash_yarn_config(
+        max_model_len=524_281, num_speculative_tokens=7
+    )
+
+    SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+    assert draft_hf_config.rope_parameters["factor"] == 2.0
+
+
+def test_dflash_yarn_inheritance_env_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_DFLASH_INHERIT_TARGET_YARN", "0")
+    config, draft_hf_config = _dflash_yarn_config()
+    original = copy.deepcopy(draft_hf_config.to_dict())
+
+    SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+    assert draft_hf_config.to_dict() == original
+
+
+def test_dflash_inherits_using_target_len_when_spec_len_unset() -> None:
+    # Mirrors the common deployment: speculative-config without max_model_len.
+    # The scheduler caps sequences at the target's max_model_len, so the
+    # drafter must be extended to that length, not silently skipped.
+    config, draft_hf_config = _dflash_yarn_config()
+    config.max_model_len = None
+    config.target_model_config.max_model_len = 524_281  # from --max-model-len
+
+    SpeculativeConfig._inherit_target_yarn_for_dflash(config)
+
+    assert draft_hf_config.rope_parameters["rope_type"] == "yarn"
+    assert config.draft_model_config.max_model_len == 524_281
+
+
+def test_dflash_rejects_target_len_without_headroom_when_spec_len_unset() -> None:
+    config, _ = _dflash_yarn_config()
+    config.max_model_len = None
+    config.target_model_config.max_model_len = 524_288
+
+    with pytest.raises(ValueError, match="Lower --max-model-len to 524281"):
+        SpeculativeConfig._inherit_target_yarn_for_dflash(config)

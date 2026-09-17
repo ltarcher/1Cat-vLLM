@@ -3,6 +3,7 @@
 
 import copy
 import math
+import os
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -995,6 +996,13 @@ class SpeculativeConfig:
                         "`num_speculative_tokens` was not provided"
                     )
 
+                if self.use_dflash_family():
+                    # Runs after the EAGLEConfig wrap (the DFlash models read
+                    # rope_parameters/max_position_embeddings straight off the
+                    # wrapped config) and after num_speculative_tokens is
+                    # resolved, so the speculative headroom check is exact.
+                    self._inherit_target_yarn_for_dflash()
+
                 if self.use_dspark():
                     dspark_block_size = getattr(
                         self.draft_model_config.hf_config,
@@ -1192,6 +1200,179 @@ class SpeculativeConfig:
             "YaRN parameters (factor=%s).",
             draft_native_limit,
             self.max_model_len,
+            factor,
+        )
+
+    def _inherit_target_yarn_for_dflash(self) -> None:
+        """Extend the DFlash drafter past its native RoPE grid (target YaRN).
+
+        A DFlash drafter is a separate checkpoint, so --hf-overrides only
+        rewrites the target config. When the target is extended with YaRN
+        (e.g. 262144 -> 524288), the drafter still builds its cos/sin cache
+        with plain inv_freq over native max_position_embeddings rows. The
+        first speculative step whose absolute positions reach the native
+        limit then fails the compiled RoPE gather's indirect-index guard
+        ("index out of bounds: ... < 262144"), poisons the CUDA context on
+        every TP rank and kills the engine. Inherit the target's YaRN
+        factor/original_max_position_embeddings so the drafter's cache covers
+        original * factor positions -- the same contract
+        _inherit_target_rope_for_extended_native_mtp enforces for native MTP.
+
+        Only scaling keys are inherited: mrope_section/mrope_interleaved and
+        the target's partial_rotary_factor describe the target's rotary
+        layout and would not even validate on the drafter's own rotary_dim.
+        rope_theta stays the drafter's own because the rotation must keep the
+        layout the drafter was distilled with.
+
+        Quality note: YaRN rescales mid frequency bands at every position,
+        not only past the native limit, so acceptance over the trained range
+        can shift. A/B accepted draft lengths with and without this
+        inheritance (rollback: VLLM_DFLASH_INHERIT_TARGET_YARN=0) before
+        trusting long-context outputs.
+        """
+        if os.getenv("VLLM_DFLASH_INHERIT_TARGET_YARN", "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
+        if self.target_model_config is None or self.draft_model_config is None:
+            return
+        # speculative_config.max_model_len is usually unset; the scheduler caps
+        # sequences at the target's max_model_len, so that is the length the
+        # drafter's RoPE must actually cover.
+        effective_max_len = (
+            self.max_model_len
+            if self.max_model_len is not None
+            else self.target_model_config.max_model_len
+        )
+        if effective_max_len is None:
+            return
+
+        draft_text_config = get_hf_text_config(self.draft_model_config.hf_config)
+        draft_native_limit = getattr(draft_text_config, "max_position_embeddings", None)
+        if draft_native_limit is None or effective_max_len <= draft_native_limit:
+            # Within the drafter's native grid its own RoPE is already valid.
+            return
+
+        draft_rope_parameters = getattr(draft_text_config, "rope_parameters", None)
+        if (
+            isinstance(draft_rope_parameters, dict)
+            and draft_rope_parameters.get("rope_type") == "yarn"
+        ):
+            # The checkpoint ships its own scaling; nothing to inherit.
+            return
+
+        target_text_config = get_hf_text_config(self.target_model_config.hf_config)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        if (
+            not isinstance(rope_parameters, dict)
+            or rope_parameters.get("rope_type") != "yarn"
+        ):
+            raise ValueError(
+                "Extending the DFlash drafter beyond its native "
+                f"max_position_embeddings={draft_native_limit} requires "
+                f"explicit target YaRN rope_parameters; got {rope_parameters!r}. "
+                "Lower --max-model-len or set yarn rope_parameters on the "
+                "target via --hf-overrides."
+            )
+
+        original_limit = rope_parameters.get("original_max_position_embeddings")
+        factor = rope_parameters.get("factor")
+        try:
+            if original_limit is None or factor is None:
+                raise TypeError("YaRN original limit and factor must be present")
+            original_limit_value = float(original_limit)
+            factor_value = float(factor)
+            draft_native_limit_value = float(draft_native_limit)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "DFlash YaRN extension requires numeric "
+                "original_max_position_embeddings and factor."
+            ) from error
+
+        if (
+            not math.isfinite(original_limit_value)
+            or not math.isfinite(factor_value)
+            or original_limit_value <= 0
+            or factor_value <= 1
+            or original_limit_value != draft_native_limit_value
+        ):
+            # The drafter was distilled on the target's native grid, so its
+            # native limit must line up with the YaRN original limit exactly.
+            raise ValueError(
+                "DFlash YaRN extension requires the target's positive "
+                "original_max_position_embeddings to match the drafter's "
+                "native max_position_embeddings and factor to be greater "
+                f"than one; got original={original_limit!r}, "
+                f"native={draft_native_limit!r}, factor={factor!r}."
+            )
+
+        scaled_limit_value = original_limit_value * factor_value
+        if not math.isfinite(scaled_limit_value):
+            raise ValueError("DFlash YaRN extension requires a finite scaled limit.")
+        scaled_limit = int(scaled_limit_value)
+        if effective_max_len > scaled_limit:
+            raise ValueError(
+                f"DFlash drafter YaRN limit={scaled_limit} "
+                f"(original={original_limit!r} * factor={factor!r}) does not "
+                f"cover max_model_len={effective_max_len}."
+            )
+        # The drafter proposes at positions seq_len .. seq_len + spec_tokens,
+        # so the cache must also cover the speculative headroom; without this
+        # a request that fills max_model_len trips the same device assert the
+        # inheritance exists to fix.
+        spec_headroom = self.num_speculative_state_tokens()
+        if effective_max_len + spec_headroom > scaled_limit:
+            raise ValueError(
+                f"max_model_len={effective_max_len} plus "
+                f"{spec_headroom} speculative tokens exceeds the DFlash "
+                f"drafter YaRN limit={scaled_limit}. Lower --max-model-len "
+                f"to {scaled_limit - spec_headroom}."
+            )
+
+        draft_theta = None
+        if isinstance(draft_rope_parameters, dict):
+            draft_theta = draft_rope_parameters.get("rope_theta")
+        inherited_parameters: dict[str, Any] = {
+            "rope_type": "yarn",
+            "rope_theta": (
+                draft_theta
+                if draft_theta is not None
+                else rope_parameters.get("rope_theta")
+            ),
+            "factor": factor,
+            "original_max_position_embeddings": original_limit,
+        }
+        # Ramp/interpolation knobs shape the yarn inv_freq identically for the
+        # drafter and the target; apply_yarn_scaling is left at its default so
+        # the drafter's mscale matches the target's mrope path.
+        for key in (
+            "beta_fast",
+            "beta_slow",
+            "extrapolation_factor",
+            "attn_factor",
+            "truncate",
+        ):
+            if key in rope_parameters:
+                inherited_parameters[key] = rope_parameters[key]
+
+        draft_text_config.rope_parameters = inherited_parameters
+        # Keep the wrapped EAGLEConfig's inner copy consistent: the wrapper
+        # mirrors inner attributes at construction time.
+        inner_config = getattr(draft_text_config, "model", None)
+        if inner_config is not None and inner_config is not draft_text_config:
+            inner_config.rope_parameters = dict(inherited_parameters)
+        # The later _maybe_override_draft_max_model_len clamps the drafter to
+        # its (still native) derived len; carry the extended limit instead so
+        # the bookkeeping matches the now-larger RoPE coverage.
+        self.draft_model_config.max_model_len = effective_max_len
+        logger.info(
+            "Extended DFlash drafter context from %s to %s with validated "
+            "target YaRN parameters (factor=%s).",
+            draft_native_limit,
+            effective_max_len,
             factor,
         )
 

@@ -252,17 +252,17 @@ def _build_balanced_offsets(
 def _iter_unique_dense_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]:
     seen: set[tuple[int, int, int]] = set()
     for layer in model.modules():
-        if not getattr(layer, "_awq_sm70_prepared", False):
+        state = getattr(layer, sm70_tm.STATE_ATTR, None)
+        if state is None or state.op_kind != "uint4":
             continue
-        k_dim = int(layer._awq_sm70_weight.shape[0])
-        n_dim = int(layer._awq_sm70_weight.shape[1] * 8)
-        group_size = _group_size_from_tm_scales(k_dim, layer._awq_sm70_scales)
+        k_dim = int(state.weight.shape[0])
+        n_dim = int(state.output_size)
+        group_size = int(state.group_size)
         key = (k_dim, n_dim, group_size)
         if key in seen:
             continue
         seen.add(key)
         yield layer
-
 
 def _iter_unique_fp8_dense_layers(
     model: torch.nn.Module,
@@ -456,26 +456,25 @@ def _warmup_dense_layers(
 ) -> int:
     calls = 0
     for layer in dense_layers:
-        device = layer._awq_sm70_weight.device
-        k_dim = int(layer._awq_sm70_weight.shape[0])
-        n_dim = int(layer._awq_sm70_weight.shape[1] * 8)
-        group_size = _group_size_from_tm_scales(k_dim, layer._awq_sm70_scales)
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        device = state.weight.device
+        k_dim = int(state.weight.shape[0])
+        n_dim = int(state.output_size)
+        group_size = int(state.group_size)
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
             sm70_ops.awq_gemm_sm70_out(
                 out,
                 x,
-                layer._awq_sm70_weight,
-                layer._awq_sm70_scales,
+                state.weight,
+                state.scales,
                 group_size,
-                layer._awq_sm70_k_ld,
-                layer._awq_sm70_q_ld,
-                False,
+                state.k_ld,
+                state.q_ld,
             )
             calls += 1
     return calls
-
 
 def _warmup_fp8_dense_layers(
     dense_layers: list[tuple[torch.nn.Module, bool]],

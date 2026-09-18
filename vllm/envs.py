@@ -470,6 +470,10 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
     VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
+    # Maximum per-rank KV heads admitted by the DFlash2 verify gates.
+    # "1" keeps the TP4-validated contract; "2" admits TP2 (H12/Hkv2)
+    # layouts once the extension advertises the kv-heads ABI revision.
+    VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS: int = 1
 
     VLLM_FLASH_V100_E4M3_GROUPED_FP32: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
@@ -3137,6 +3141,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
     "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
+    ),
+    # Rollout switch for the TP2 (H12/Hkv2) DFlash2 verify routes. The
+    # default pins today's TP4-validated single-KV-head contract.
+    "VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS": lambda: int(
+        os.getenv("VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS", "1")
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")

@@ -503,6 +503,7 @@ _flash_attn_decode_paged_wmma = None
 _flash_attn_grouped_verify_paged = None
 _flash_attn_grouped_verify_max_query_tokens = 8
 _flash_attn_grouped_verify_request_major_abi_version = 0
+_flash_attn_grouped_verify_kv_heads_abi_version = 0
 _flash_attn_grouped_verify_checked = False
 _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
@@ -1272,6 +1273,7 @@ def _get_flash_grouped_verify_op():
     global _flash_attn_grouped_verify_paged
     global _flash_attn_grouped_verify_max_query_tokens
     global _flash_attn_grouped_verify_request_major_abi_version
+    global _flash_attn_grouped_verify_kv_heads_abi_version
     global _flash_attn_grouped_verify_checked
     if _flash_attn_grouped_verify_checked:
         return _flash_attn_grouped_verify_paged
@@ -1301,6 +1303,16 @@ def _get_flash_grouped_verify_op():
             )
         except (ImportError, RuntimeError, TypeError, ValueError):
             _flash_attn_grouped_verify_request_major_abi_version = 0
+        try:
+            from flash_attn_v100 import (
+                flash_attn_grouped_verify_kv_heads_abi_version,
+            )
+
+            _flash_attn_grouped_verify_kv_heads_abi_version = int(
+                flash_attn_grouped_verify_kv_heads_abi_version()
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            _flash_attn_grouped_verify_kv_heads_abi_version = 0
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return _flash_attn_grouped_verify_paged
@@ -4514,6 +4526,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.dflash2_grouped_verify_request_major_abi_version = (
             _flash_attn_grouped_verify_request_major_abi_version
         )
+        self.dflash2_grouped_verify_kv_heads_abi_version = (
+            _flash_attn_grouped_verify_kv_heads_abi_version
+        )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
             _get_sm70_v37_e4m3_bridge_op()
@@ -4659,15 +4674,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # dense grouped verifier on the compacted page set. TOPK=0 disables it
         # so the dense path remains the default.
         self.dflash2_sparse_verify_op = _get_flash_dflash2_sparse_op()
-        self.dflash2_sparse_topk_tokens = (
-            envs.VLLM_FLASH_V100_DFLASH2_SPARSE_TOPK
-        )
-        self.dflash2_sparse_window_tokens = (
-            envs.VLLM_FLASH_V100_DFLASH2_SPARSE_WINDOW
-        )
-        self.dflash2_sparse_sink_tokens = (
-            envs.VLLM_FLASH_V100_DFLASH2_SPARSE_SINK
-        )
+        self.dflash2_sparse_topk_tokens = envs.VLLM_FLASH_V100_DFLASH2_SPARSE_TOPK
+        self.dflash2_sparse_window_tokens = envs.VLLM_FLASH_V100_DFLASH2_SPARSE_WINDOW
+        self.dflash2_sparse_sink_tokens = envs.VLLM_FLASH_V100_DFLASH2_SPARSE_SINK
         self.dflash2_sparse_min_seq = envs.VLLM_FLASH_V100_DFLASH2_SPARSE_MIN_SEQ
         self.use_dflash2_sparse_verify = (
             self.use_dflash2_grouped_verify
@@ -5472,10 +5481,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 num_query_tokens if num_reqs == 1 else 0,
             )
         )
+        # Per-rank KV heads: 1 on TP4 (H6/Hkv1), 2 on TP2 (H12/Hkv2). The
+        # single-KV-head contract stays unconditional; the second head needs
+        # both the env rollout switch and an extension advertising the
+        # kv-heads ABI, so a stale binary keeps today's TP4 route only.
+        kv_heads = int(key_cache.shape[2]) if key_cache.ndim == 4 else 0
+        kv_heads_ok = kv_heads == 1 or (
+            kv_heads == 2
+            and int(envs.VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS) >= 2
+            and self.dflash2_grouped_verify_kv_heads_abi_version >= 2
+        )
         single_request_shape = bool(
             num_reqs == 1
             and num_query_tokens in (8, 16)
             and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+            # q16 tiles split within one KV head's six query heads, so the
+            # multi-KV-head grid is qualified for q8 routes only.
+            and (num_query_tokens == 8 or kv_heads == 1)
         )
         batched_request_shape = bool(
             self.use_dflash2_batched_grouped_verify
@@ -5493,7 +5515,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and tuple(query.shape) == (num_query_tokens, 6, 256)
+            and tuple(query.shape) == (num_query_tokens, 6 * kv_heads, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
             and key_cache.ndim == 4
@@ -5504,7 +5526,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             # block-8 service's 1648/3296 layout to 1728/3456. The grouped
             # operator's runtime-stride implementation is exact for both.
             and key_cache.shape[1] in (1648, 1728, 3296, 3456)
-            and tuple(key_cache.shape[2:]) == (1, 256)
+            and kv_heads in (1, 2)
+            and kv_heads_ok
+            and key_cache.shape[3] == 256
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8
             and value_cache.dtype == torch.uint8
@@ -5576,12 +5600,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> None:
         global _logged_prefill_smallq_grouped_verify
         num_reqs = int(attn_metadata.block_table.shape[0])
+        kv_heads = int(key_cache.shape[2])
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(request-major B%d/q%d/H6/Hkv1/D256, %s KV, one-pass).",
+                "(request-major B%d/q%d/H%d/Hkv%d/D256, %s KV, one-pass).",
                 num_reqs,
                 query.shape[0] // num_reqs,
+                6 * kv_heads,
+                kv_heads,
                 self.kv_cache_dtype,
             )
             _logged_prefill_smallq_grouped_verify = True
@@ -5674,9 +5701,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify_sparse:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 sparse verifier active "
-                "(request-major B%d/q8/H6/D256, %s KV, topk=%d window=%d "
+                "(request-major B%d/q8/H%d/D256, %s KV, topk=%d window=%d "
                 "sink=%d).",
                 int(attn_metadata.block_table.shape[0]),
+                6 * int(key_cache.shape[2]),
                 self.kv_cache_dtype,
                 self.dflash2_sparse_topk_tokens,
                 self.dflash2_sparse_window_tokens,

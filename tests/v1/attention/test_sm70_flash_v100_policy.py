@@ -2134,6 +2134,90 @@ def test_flash_v100_dflash2_q16_falls_back_for_q8_native_binary():
     assert torch.all(output == 1)
 
 
+def test_flash_v100_dflash2_tp2_kv_heads_gate_contract(monkeypatch):
+    """H12/Hkv2 admission needs env>=2 AND the kv-heads ABI.
+
+    The TP4 single-KV-head contract stays unconditional: an old extension
+    and the default env keep today's route, and a stale binary never gains
+    the TP2 routes just because the env is raised.
+    """
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=12,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=2,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+    impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    impl.flash_attn_grouped_verify_paged = object()
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=8,
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=32768,
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([2056], dtype=torch.int32),
+        block_table=torch.tensor([[7, 3]], dtype=torch.int32),
+        smallq_decode_block_table=torch.zeros((8, 2), dtype=torch.int32),
+        smallq_decode_seq_lens=torch.arange(2049, 2057, dtype=torch.int32),
+        smallq_query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+    )
+    query = torch.zeros((8, 12, 256), dtype=torch.float16)
+    key_cache = torch.zeros((2, 3456, 2, 256), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+
+    def gate():
+        return impl._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=8,
+        )
+
+    # Default env ("1"): today's TP4-only contract, regardless of ABI.
+    monkeypatch.delenv("VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS", raising=False)
+    impl.dflash2_grouped_verify_kv_heads_abi_version = 2
+    assert not gate()
+    # Stale extension without the kv-heads getter: env alone never admits.
+    monkeypatch.setenv("VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS", "2")
+    impl.dflash2_grouped_verify_kv_heads_abi_version = 0
+    assert not gate()
+    impl.dflash2_grouped_verify_kv_heads_abi_version = 1
+    assert not gate()
+    # env=2 plus ABI revision 2 admits the TP2 (H12/Hkv2) route.
+    impl.dflash2_grouped_verify_kv_heads_abi_version = 2
+    assert gate()
+    # q16 stays single-KV-head even when TP2 is admitted.
+    query16 = torch.zeros((16, 12, 256), dtype=torch.float16)
+    attn_metadata.query_start_loc = torch.tensor([0, 16], dtype=torch.int32)
+    assert not impl._dflash2_grouped_verify_allowed(
+        query16,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        num_query_tokens=16,
+    )
+    attn_metadata.query_start_loc = torch.tensor([0, 8], dtype=torch.int32)
+    # The TP4 route keeps working on a stale extension and the default env.
+    monkeypatch.delenv("VLLM_FLASH_V100_DFLASH2_VERIFY_MAX_KV_HEADS", raising=False)
+    impl.dflash2_grouped_verify_kv_heads_abi_version = 0
+    query6 = torch.zeros((8, 6, 256), dtype=torch.float16)
+    key_cache1 = torch.zeros((2, 3456, 1, 256), dtype=torch.uint8)
+    assert impl._dflash2_grouped_verify_allowed(
+        query6,
+        key_cache1,
+        torch.zeros_like(key_cache1),
+        attn_metadata,
+        num_query_tokens=8,
+    )
+
+
 def test_flash_v100_decode_forwards_shape_hints():
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 

@@ -524,6 +524,8 @@ def _get_grouped_verify_workspace(
     query_len = q.shape[0] // batch_size
     max_query_tokens = 16 if query_len > 8 else 8
     grouped_splits = 640 // max_query_tokens
+    # Per-rank query heads: 6 for one KV head (TP4), 12 for two (TP2).
+    num_heads = int(q.shape[1])
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
@@ -531,6 +533,7 @@ def _get_grouped_verify_workspace(
         _workspace_stream_id(q.device),
         batch_size,
         max_query_tokens,
+        num_heads,
         q.dtype,
         partial_dtype,
     )
@@ -539,14 +542,14 @@ def _get_grouped_verify_workspace(
     )
     if workspace is None:
         partial_out_shape = (
-            (grouped_splits, max_query_tokens, 6, 256)
+            (grouped_splits, max_query_tokens, num_heads, 256)
             if batch_size == 1
-            else (batch_size, grouped_splits, max_query_tokens, 6, 256)
+            else (batch_size, grouped_splits, max_query_tokens, num_heads, 256)
         )
         partial_lse_shape = (
-            (grouped_splits, max_query_tokens, 6)
+            (grouped_splits, max_query_tokens, num_heads)
             if batch_size == 1
-            else (batch_size, grouped_splits, max_query_tokens, 6)
+            else (batch_size, grouped_splits, max_query_tokens, num_heads)
         )
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
@@ -1104,6 +1107,16 @@ def flash_attn_grouped_verify_request_major_abi_version() -> int:
     return 0 if get_abi_version is None else int(get_abi_version())
 
 
+def flash_attn_grouped_verify_kv_heads_abi_version() -> int:
+    """Return zero for binaries that only support one KV head per rank."""
+    get_abi_version = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_kv_heads_abi_version",
+        None,
+    )
+    return 0 if get_abi_version is None else int(get_abi_version())
+
+
 def flash_attn_grouped_e4m3_fp32_available() -> bool:
     version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
     return (
@@ -1171,13 +1184,15 @@ def flash_attn_grouped_verify_paged(
     token_table: bool = False,
     compact_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
+    """Exact request-major grouped q8/q16 DFlash2 verifier for SM70.
 
     Each request has one block-table row and a uniform contiguous query span.
     The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across a packed GQA group. Single-request q16 uses two
-    three-head groups; batched requests use request-major q8 groups. Workspaces
-    are stream- and batch-local and CUDA-graph safe.
+    paged-KV scan across a packed GQA group: six query heads per per-rank KV
+    head (H6/Hkv1 on TP4, H12/Hkv2 on TP2). Single-request q16 uses two
+    three-head groups and stays single-KV-head; batched requests use
+    request-major q8 groups. Workspaces are stream- and batch-local and
+    CUDA-graph safe.
 
     ``token_table=True`` switches the block table to compact 32-token tile
     tables: entries are absolute token bases and the loader resolves each
@@ -1286,9 +1301,10 @@ def flash_attn_dflash2_verify_sparse_paged(
             f"seq_len {seq_len} outside the sparse verify range "
             f"[{min_sparse_tokens}, {max_sparse_tokens}]"
         )
-    workspace = _get_dflash2_sparse_workspace(
-        q, q.shape[0] // _DFLASH2_SPARSE_DRAFT_ROWS
-    )
+    # One compact tile table per (request, per-rank KV head); TP2 layouts
+    # carry two KV heads per rank.
+    sparse_rows = (q.shape[0] // _DFLASH2_SPARSE_DRAFT_ROWS) * int(k_cache.shape[2])
+    workspace = _get_dflash2_sparse_workspace(q, sparse_rows)
     flash_attn_v100_cuda.dflash2_verify_sparse_topk(
         q,
         k_cache,

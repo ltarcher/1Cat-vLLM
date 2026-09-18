@@ -252,6 +252,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                     group_size=self.group_size,
                     symmetric=bool(self.symmetric),
                 )
+                # Optional bounded-workspace exact-dense prefill route; on
+                # any failed gate the layer keeps the TurboMind uint4 path.
+                sm70_tm.attach_wna16_prefill_exact_dense(layer)
                 layer.weight_packed = torch.nn.Parameter(
                     torch.empty(
                         0, dtype=torch.int32, device=layer.weight_packed.device

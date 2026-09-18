@@ -7,7 +7,10 @@ from typing import Literal
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 U4_GROUP_SIZES = (32, 64, 128)
 GPTQ_GROUP_SIZES = (128,)
@@ -36,6 +39,110 @@ class SM70TurboMindLinearState:
     global_scale: float = 0.0
     use_scale_code: bool = False
     padded_output_size: int = 0
+    prefill_dense_workspace: torch.Tensor | None = None
+
+
+# Compressed-tensors W4A16 exact-dense prefill: bounded FP16 expansion of the
+# TurboMind uint4 state, consumed by the shared AWQ dequant operator plus
+# cuBLAS. Shapes are the Qwen3.8-27B TP4 per-rank prepared projections; all
+# satisfy the dequant contract (group_size 128, K % 128 == 0, N % 32 == 0).
+_SM70_WNA16_PREFILL_DENSE_MIN_M = 2048
+# The runtime GDN input projection is one fused in_proj_qkvz module
+# (per-rank N = (10240 + 6144) / 4) even though the Qwen3.8 checkpoint
+# stores in_proj_qkv and in_proj_z as separate tensors.
+_SM70_WNA16_PREFILL_DENSE_SHAPES = {
+    "gate_up_proj": (5120, 8704),
+    "down_proj": (4352, 5120),
+    "in_proj_qkvz": (5120, 4096),
+    "out_proj": (1536, 5120),
+    "qkv_proj": (5120, 3584),
+    "o_proj": (1536, 5120),
+}
+_SM70_WNA16_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
+    k * n for k, n in _SM70_WNA16_PREFILL_DENSE_SHAPES.values()
+)
+_wna16_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+# One info line per admitted projection class keeps load-time route evidence
+# observable without one line per layer.
+_wna16_prefill_dense_admitted_suffixes: set[str] = set()
+
+
+def _has_awq_dequantize_out_op() -> bool:
+    return hasattr(torch.ops._C, "awq_sm70_dequantize_out")
+
+
+def _get_wna16_prefill_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    cache_key = (device_index, torch.float16)
+    workspace = _wna16_prefill_dense_workspaces.get(cache_key)
+    if workspace is not None:
+        return workspace
+    try:
+        workspace = torch.empty(
+            (_SM70_WNA16_PREFILL_DENSE_WORKSPACE_ELEMENTS,),
+            dtype=torch.float16,
+            device=weight.device,
+        )
+    except torch.OutOfMemoryError:
+        logger.warning_once(
+            "Insufficient memory for the bounded SM70 WNA16 prefill workspace; "
+            "falling back to the TurboMind uint4 path."
+        )
+        return None
+    _wna16_prefill_dense_workspaces[cache_key] = workspace
+    return workspace
+
+
+def attach_wna16_prefill_exact_dense(layer: torch.nn.Module) -> bool:
+    """Attach the bounded-workspace exact-dense prefill route to one layer.
+
+    Evaluates the load-time contract once, after
+    :func:`prepare_compressed_uint4_linear`. On any failed condition the
+    layer silently keeps the TurboMind uint4 path unchanged.
+    """
+    if not envs.VLLM_SM70_WNA16_PREFILL_EXACT_DENSE:
+        return False
+    if not _has_awq_dequantize_out_op():
+        return False
+    state = getattr(layer, STATE_ATTR, None)
+    if state is None or state.op_kind != "uint4":
+        return False
+    if state.group_size != 128 or state.gated_silu:
+        return False
+    if getattr(layer, "tp_size", 1) != 4:
+        return False
+    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    expected = _SM70_WNA16_PREFILL_DENSE_SHAPES.get(suffix)
+    if expected is None:
+        return False
+    scales = state.scales
+    # The shared dequant operator consumes the non-compact TurboMind
+    # statistics: int32 [k / group_size, n] with fused scale and zero words.
+    if scales.dtype != torch.int32 or scales.dim() != 2:
+        return False
+    n = state.output_size
+    k = scales.size(0) * state.group_size
+    if scales.size(1) != n or (k, n) != expected:
+        return False
+    workspace = _get_wna16_prefill_dense_workspace(scales)
+    if workspace is None:
+        return False
+    state.prefill_dense_workspace = workspace
+    if suffix not in _wna16_prefill_dense_admitted_suffixes:
+        _wna16_prefill_dense_admitted_suffixes.add(suffix)
+        logger.info(
+            "SM70 WNA16 exact-dense prefill attached: %s (K=%d, N=%d).",
+            suffix,
+            k,
+            n,
+        )
+    logger.info_once(
+        "SM70 compressed-tensors WNA16 exact-dense prefill path enabled "
+        "with a bounded 85 MiB workspace."
+    )
+    return True
 
 
 # States retain only data_ptr(), so this cache owns the bounded allocation.
@@ -43,8 +150,9 @@ _nvfp4_qpn4_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
 def clear_sm70_turbomind_workspaces() -> None:
-    """Release process-global NVFP4 QPN4 dense workspaces."""
+    """Release process-global NVFP4 QPN4 and WNA16 prefill workspaces."""
     _nvfp4_qpn4_dense_workspaces.clear()
+    _wna16_prefill_dense_workspaces.clear()
 
 
 def quant_backend() -> SM70QuantBackend:
@@ -411,6 +519,95 @@ def prepare_nvfp4_qpn4_linear(
     )
 
 
+def _wna16_dense_prefill_mm_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    kernel_output_size: int,
+    min_m: int,
+) -> torch.Tensor:
+    """Body of ``sm70_tm::wna16_dense_prefill_mm``; see the registered op."""
+    from vllm import _sm70_ops as sm70_ops
+
+    workspace = None
+    if x.dtype == torch.float16:
+        device_index = x.device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        workspace = _wna16_prefill_dense_workspaces.get((device_index, torch.float16))
+    if workspace is not None and x.shape[0] >= min_m:
+        # Exact-dense prefill: expand the shared TurboMind uint4 encoding
+        # into the bounded workspace and run cuBLAS. The dequant operator is
+        # the AWQ one because both prepares share one packed encoding, one
+        # GEMM consumer.
+        k = x.shape[1]
+        dense_weight = workspace[: k * output_size].view(k, output_size)
+        sm70_ops.awq_sm70_dequantize_out(dense_weight, weight, scales, group_size)
+        out = torch.mm(x, dense_weight)
+        if kernel_output_size != output_size:
+            padded = x.new_empty((x.shape[0], kernel_output_size))
+            padded[:, :output_size] = out
+            return padded
+        return out
+    out = x.new_empty((x.shape[0], kernel_output_size))
+    sm70_ops.awq_gemm_sm70_out(out, x, weight, scales, group_size, k_ld, q_ld)
+    return out
+
+
+@torch.library.custom_op("sm70_tm::wna16_dense_prefill_mm", mutates_args=())
+def wna16_dense_prefill_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    kernel_output_size: int,
+    min_m: int,
+) -> torch.Tensor:
+    """Route WNA16 uint4 linears between dense prefill and TurboMind.
+
+    The M-dependent choice must stay inside one registered op. A Python
+    branch on the symbolic token count compiles a shape guard into every
+    compiled piece and pushed the captured decode step off its full-graph
+    fast path (measured 3.4x decode-step regression on the production
+    endpoint). The workspace is resolved from the module cache instead of
+    the op schema, so the op stays a pure function of its inputs with no
+    mutated arguments for dynamo and inductor to functionalize.
+    """
+    return _wna16_dense_prefill_mm_impl(
+        x,
+        weight,
+        scales,
+        group_size,
+        k_ld,
+        q_ld,
+        output_size,
+        kernel_output_size,
+        min_m,
+    )
+
+
+@wna16_dense_prefill_mm.register_fake
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    kernel_output_size: int,
+    min_m: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], kernel_output_size))
+
+
 def apply_prepared_linear(
     layer: torch.nn.Module,
     x: torch.Tensor,
@@ -420,72 +617,89 @@ def apply_prepared_linear(
     reshaped_x = x.reshape(-1, x.shape[-1])
     out_shape = x.shape[:-1] + (state.output_size,)
     kernel_output_size = state.padded_output_size or state.output_size
-    out = torch.empty(
-        (reshaped_x.shape[0], kernel_output_size),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    from vllm import _sm70_ops as sm70_ops
-
-    if state.op_kind == "uint4":
-        sm70_ops.awq_gemm_sm70_out(
-            out,
+    if state.op_kind == "uint4" and state.prefill_dense_workspace is not None:
+        # Exact-dense prefill route. The dense-vs-TurboMind choice lives
+        # inside the registered op, opaque to dynamo; the eligibility check
+        # here consults load-time state only, never the runtime shape.
+        out = torch.ops.sm70_tm.wna16_dense_prefill_mm(
             reshaped_x,
             state.weight,
             state.scales,
             state.group_size,
             state.k_ld,
             state.q_ld,
-        )
-    elif state.op_kind == "mxfp4":
-        sm70_ops.mxfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4" and state.use_scale_code:
-        sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4":
-        sm70_ops.nvfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-        )
-    elif state.op_kind == "nvfp4_qpn4":
-        if reshaped_x.dtype != torch.float16:
-            raise RuntimeError(
-                f"SM70 NVFP4 QPN4 requires float16 activations, got {reshaped_x.dtype}."
-            )
-        if reshaped_x.stride(-1) != 1:
-            reshaped_x = reshaped_x.contiguous()
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
-            out,
-            state.dense_weight_ptr,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            False,
+            state.output_size,
+            kernel_output_size,
+            _SM70_WNA16_PREFILL_DENSE_MIN_M,
         )
     else:
-        raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
+        out = torch.empty(
+            (reshaped_x.shape[0], kernel_output_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        from vllm import _sm70_ops as sm70_ops
+
+        if state.op_kind == "uint4":
+            sm70_ops.awq_gemm_sm70_out(
+                out,
+                reshaped_x,
+                state.weight,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+            )
+        elif state.op_kind == "mxfp4":
+            sm70_ops.mxfp4_gemm_sm70_out(
+                out,
+                reshaped_x,
+                state.weight,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+            )
+        elif state.op_kind == "nvfp4" and state.use_scale_code:
+            sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+                out,
+                reshaped_x,
+                state.weight,
+                state.scales,
+                state.global_scale,
+                state.k_ld,
+                state.q_ld,
+            )
+        elif state.op_kind == "nvfp4":
+            sm70_ops.nvfp4_gemm_sm70_out(
+                out,
+                reshaped_x,
+                state.weight,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+            )
+        elif state.op_kind == "nvfp4_qpn4":
+            if reshaped_x.dtype != torch.float16:
+                raise RuntimeError(
+                    f"SM70 NVFP4 QPN4 requires float16 activations, "
+                    f"got {reshaped_x.dtype}."
+                )
+            if reshaped_x.stride(-1) != 1:
+                reshaped_x = reshaped_x.contiguous()
+            sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
+                out,
+                state.dense_weight_ptr,
+                reshaped_x,
+                state.weight,
+                state.scales,
+                state.global_scale,
+                state.use_scale_code,
+                False,
+            )
+        else:
+            raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
     if kernel_output_size != state.output_size:
         out = out[:, : state.output_size]
     if state.gated_silu and state.op_kind == "nvfp4":

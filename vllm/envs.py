@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS: int = 80
     VLLM_SM70_AWQ_MLP_ENGINE: bool = False
     VLLM_SM70_AWQ_PREFILL_EXACT_DENSE: bool = True
+    VLLM_SM70_WNA16_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE: Literal["inline", "engine"] = "inline"
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL: int = 5120
@@ -1809,6 +1810,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bounded FP16 workspace before their exact dense GEMM.
     "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
+    ),
+    # Expand selected large-M TP4 compressed-tensors W4A16 projections into
+    # one reusable bounded FP16 workspace before their exact dense GEMM.
+    # The prepared uint4 state shares the AWQ packed encoding, so the same
+    # dequant operator and cuBLAS serve this route.
+    "VLLM_SM70_WNA16_PREFILL_EXACT_DENSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_WNA16_PREFILL_EXACT_DENSE", "1"))
     ),
     # Expand selected large-M TP4 FP8 projections into one reusable bounded
     # FP16 workspace before their exact dense GEMM. The allowlist and M gate
